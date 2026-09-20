@@ -3349,6 +3349,66 @@ impl ReaderPool {
         .await
     }
 
+    /// Return one named session when it is eligible for auto-improvement.
+    ///
+    /// The `SessionEnd` trigger (`[auto_improve] on_session_end`) reviews the
+    /// session that just ended, so it cannot use the ordered, age-filtered
+    /// candidate list above. It applies the identical eligibility rules to a
+    /// single session: past the scope watermark, ended, not claimed, and not
+    /// already covered by a run. The age cutoff is the one rule it drops,
+    /// because that cutoff exists only to keep the hourly scheduler away from a
+    /// session whose hook traffic is still in flight, and the trigger fires
+    /// after that traffic. The two paths write the same claim row, so a session
+    /// reviewed here is never reviewed again by the scheduler.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn auto_improve_candidate_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<Option<AutoImproveCandidateSession>> {
+        self.with_conn(move |conn| {
+            let ended_at: Option<i64> = conn
+                .query_row(
+                    "SELECT s.ended_at FROM sessions s \
+                     JOIN auto_improve_scheduler_state st \
+                       ON st.workspace_id = s.workspace_id \
+                      AND st.project_id = s.project_id \
+                     WHERE s.id = ?3 \
+                       AND s.workspace_id = ?1 \
+                       AND s.project_id = ?2 \
+                       AND s.ended_at IS NOT NULL \
+                       AND s.ended_at > st.watermark_ended_at \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM auto_improve_scheduler_claims c \
+                           WHERE c.workspace_id = s.workspace_id \
+                             AND c.project_id = s.project_id \
+                             AND c.session_id = s.id \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM auto_improve_runs r \
+                           WHERE r.workspace_id = s.workspace_id \
+                             AND r.project_id = s.project_id \
+                             AND r.session_id = s.id \
+                       )",
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        session_id.as_bytes(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(ended_at.map(|ended_at| AutoImproveCandidateSession {
+                session_id,
+                ended_at,
+            }))
+        })
+        .await
+    }
+
     /// Look up the `(workspace_id, project_id)` a session belongs to.
     /// Returns `None` when no such session row exists.
     ///

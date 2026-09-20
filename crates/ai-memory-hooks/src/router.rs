@@ -467,6 +467,17 @@ pub struct HookState {
     /// Coalescing wake-up for the durable SessionEnd consolidation worker.
     /// The database is the queue; notifications only reduce pickup latency.
     pub session_consolidation_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Opt-in (`AI_MEMORY_AUTO_IMPROVE__ON_SESSION_END`): hand the session that
+    /// just ended to the auto-improvement reviewer instead of waiting for the
+    /// hourly scheduler tick. `None` when the setting is off, when no LLM
+    /// provider is configured, or on a transport without the reviewer worker.
+    ///
+    /// The channel is bounded and the hook only ever uses `try_send`, so a
+    /// busy reviewer cannot slow a hook down or grow a queue (invariant 5). A
+    /// dropped request costs nothing: the session keeps no claim row, so the
+    /// hourly scheduler still reviews it later.
+    pub auto_improve_session_end:
+        Option<tokio::sync::mpsc::Sender<ai_memory_consolidate::SessionEndAutoImproveRequest>>,
     /// Opt-in (`AI_MEMORY_CAPTURE_ASSISTANT`): when true, the server honors the
     /// client's `_ai_memory_assistant` protocol on a `Stop` event and persists
     /// the sanitized excerpt as the Stop body. Off by default; when off the
@@ -2397,6 +2408,38 @@ async fn process_envelope(
     true
 }
 
+/// Hand the just-ended session to the auto-improvement reviewer.
+///
+/// The send is non-blocking by construction. A reviewer run takes a large
+/// model tens of seconds, and a hook must return in well under a second, so
+/// this never awaits the reviewer and never awaits channel capacity.
+fn request_session_end_auto_improve(
+    state: &HookState,
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) {
+    let Some(sender) = state.auto_improve_session_end.as_ref() else {
+        return;
+    };
+    let request = ai_memory_consolidate::SessionEndAutoImproveRequest {
+        workspace_id,
+        project_id,
+        session_id,
+    };
+    match sender.try_send(request) {
+        Ok(()) => debug!(session = %session_id, "SessionEnd auto-improve review requested"),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => warn!(
+            session = %session_id,
+            "SessionEnd auto-improve queue is full; the hourly scheduler keeps the session"
+        ),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => warn!(
+            session = %session_id,
+            "SessionEnd auto-improve worker is gone; the hourly scheduler keeps the session"
+        ),
+    }
+}
+
 async fn enqueue_session_end_consolidation(
     state: &HookState,
     session_id: SessionId,
@@ -2730,6 +2773,12 @@ async fn process_authorized(
                     session.project_id(),
                 )
                 .await?;
+                request_session_end_auto_improve(
+                    state,
+                    session_id,
+                    session.workspace_id(),
+                    session.project_id(),
+                );
             }
             if let Some(key) = ingest_key {
                 let _ = state
@@ -2996,6 +3045,7 @@ async fn process_authorized(
         // their git snapshot. Stale redelivery above repairs cancellation in
         // the narrow window after `end_session`.
         enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
+        request_session_end_auto_improve(state, session_id, ws, proj);
         if let Some(handoff_id) = handoff_id {
             info!(
                 session = %session_id,
@@ -3730,6 +3780,7 @@ mod tests {
             active_project: ActiveProject::new(),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
+            auto_improve_session_end: None,
             capture_assistant_enabled: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
@@ -9687,6 +9738,105 @@ mod tests {
             .expect("SessionEnd persisted a consolidation job");
         assert_eq!(job.session_id(), sid.parse().unwrap());
         assert_eq!(job.generation(), 2);
+    }
+
+    /// `[auto_improve] on_session_end` hands the session to a background
+    /// reviewer. The hook must hand it over and return: a reviewer call takes
+    /// a large model tens of seconds, and a hook has milliseconds.
+    #[tokio::test]
+    async fn session_end_requests_one_auto_improve_review_without_calling_the_provider() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm.clone(),
+            state.workspace_id,
+            state.project_id,
+        )));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        state.auto_improve_session_end = Some(tx);
+        let sid = "13131313-1313-1313-1313-131313131313";
+        let fire = |event: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid, "prompt": "finish" }),
+            )
+        };
+        process(&state, fire("user-prompt-submit"), None, Vec::new())
+            .await
+            .unwrap();
+        process(&state, fire("session-end"), None, Vec::new())
+            .await
+            .unwrap();
+
+        assert!(
+            llm.0.lock().unwrap().is_none(),
+            "the hook path must leave the reviewer call to the background worker"
+        );
+        let request = rx
+            .try_recv()
+            .expect("SessionEnd must request a review when the setting is on");
+        assert_eq!(request.session_id, sid.parse().unwrap());
+        assert_eq!(request.workspace_id, state.workspace_id);
+        assert_eq!(request.project_id, state.project_id);
+        assert!(
+            rx.try_recv().is_err(),
+            "one SessionEnd must request exactly one review"
+        );
+    }
+
+    /// The default is off. With no request channel the hook path must behave
+    /// exactly as it did before the setting was wired: the hourly scheduler
+    /// stays the only trigger.
+    #[tokio::test]
+    async fn session_end_requests_no_review_when_the_setting_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm.clone(),
+            state.workspace_id,
+            state.project_id,
+        )));
+        // A live channel exists, but the state does not hold its sender —
+        // the shape `session_end_auto_improve_provider` produces when
+        // `on_session_end` is false.
+        let (_tx, mut rx) =
+            tokio::sync::mpsc::channel::<ai_memory_consolidate::SessionEndAutoImproveRequest>(4);
+        state.auto_improve_session_end = None;
+        let sid = "14141414-1414-1414-1414-141414141414";
+        let fire = |event: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid, "prompt": "finish" }),
+            )
+        };
+        process(&state, fire("user-prompt-submit"), None, Vec::new())
+            .await
+            .unwrap();
+        process(&state, fire("session-end"), None, Vec::new())
+            .await
+            .unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "the default must schedule no review at all"
+        );
+        assert!(llm.0.lock().unwrap().is_none());
     }
 
     #[tokio::test]

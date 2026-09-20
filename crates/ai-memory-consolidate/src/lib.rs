@@ -37,8 +37,9 @@ pub use auto_improve::{
     run_auto_improve_review,
 };
 pub use auto_improve_schedule::{
-    ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome,
-    initialize_auto_improve_scheduler_scopes, run_auto_improve_scheduler_tick,
+    ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome, SessionEndAutoImproveOutcome,
+    SessionEndAutoImproveRequest, initialize_auto_improve_scheduler_scopes,
+    run_auto_improve_scheduler_tick, run_session_end_auto_improve,
 };
 pub use auto_improve_telemetry::{
     AutoImproveTelemetryFinding, AutoImproveTelemetryParams, AutoImproveTelemetryReport,

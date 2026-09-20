@@ -292,7 +292,7 @@ pub async fn run_auto_improve_scheduler_tick(
                 );
                 continue;
             }
-            match run_scheduled_auto_improve(&ctx, candidate.session_id).await {
+            match run_scheduled_auto_improve(&ctx, candidate.session_id, "scheduler").await {
                 Ok(run) => {
                     outcome.reviewed += 1;
                     outcome.skipped += run.skipped.len();
@@ -343,6 +343,7 @@ pub async fn run_auto_improve_scheduler_tick(
 async fn run_scheduled_auto_improve(
     ctx: &ScheduledAutoImproveContext<'_>,
     session_id: SessionId,
+    trigger: &str,
 ) -> Result<ScheduledAutoImproveOutcome> {
     let cfg = ctx.settings.review.clone();
     let report = run_auto_improve_review(
@@ -354,7 +355,122 @@ async fn run_scheduled_auto_improve(
         cfg.clone(),
     )
     .await?;
-    stage_and_apply(ctx, Some(session_id), &report, "scheduler").await
+    stage_and_apply(ctx, Some(session_id), &report, trigger).await
+}
+
+/// Outcome of one `SessionEnd`-triggered auto-improvement attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndAutoImproveOutcome {
+    /// The session was not eligible: it is below the scope watermark, or the
+    /// hourly scheduler or an earlier run already covered it.
+    NotEligible,
+    /// Another claimer took the session between the lookup and the claim.
+    AlreadyClaimed,
+    /// The review ran. The gates inside the review still decide whether it
+    /// produced proposals.
+    Reviewed {
+        /// Proposals the store staged for this run.
+        proposals: usize,
+        /// Proposals applied to the wiki immediately.
+        approved: usize,
+    },
+}
+
+/// The one session a `SessionEnd`-triggered review covers.
+///
+/// The hook router sends this over its request channel, and the server's
+/// reviewer worker passes it straight to [`run_session_end_auto_improve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionEndAutoImproveRequest {
+    /// Workspace the session belongs to.
+    pub workspace_id: WorkspaceId,
+    /// Project the session belongs to.
+    pub project_id: ProjectId,
+    /// Session that just ended.
+    pub session_id: SessionId,
+}
+
+/// Review one session immediately after it ends
+/// (`[auto_improve] on_session_end`).
+///
+/// This is the same work the hourly tick does for one session: claim the
+/// session, run [`run_auto_improve_review`], then stage and apply the
+/// proposals. It shares the claim row with the scheduler, so the scheduler
+/// never reviews a session this function claimed. It also shares the review
+/// config, so `min_observations`, `min_session_duration_secs` and
+/// `min_confidence` still gate the run.
+///
+/// The caller runs this in the background. A `SessionEnd` hook must not wait
+/// for a reviewer model.
+///
+/// # Errors
+/// Fails when the candidate lookup, the claim, or the review pipeline fails.
+pub async fn run_session_end_auto_improve(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: &Wiki,
+    llm: &Arc<dyn LlmProvider>,
+    settings: &ScheduledAutoImproveSettings,
+    request: SessionEndAutoImproveRequest,
+) -> Result<SessionEndAutoImproveOutcome> {
+    let SessionEndAutoImproveRequest {
+        workspace_id,
+        project_id,
+        session_id,
+    } = request;
+    writer
+        .ensure_auto_improve_scheduler_state(workspace_id, project_id)
+        .await?;
+    let Some(candidate) = reader
+        .auto_improve_candidate_session(workspace_id, project_id, session_id)
+        .await?
+    else {
+        return Ok(SessionEndAutoImproveOutcome::NotEligible);
+    };
+    if !writer
+        .claim_auto_improve_scheduler_session(
+            workspace_id,
+            project_id,
+            session_id,
+            candidate.ended_at,
+        )
+        .await?
+    {
+        return Ok(SessionEndAutoImproveOutcome::AlreadyClaimed);
+    }
+    let ctx = ScheduledAutoImproveContext {
+        reader,
+        writer,
+        wiki,
+        llm,
+        workspace_id,
+        project_id,
+        settings,
+    };
+    let run = run_scheduled_auto_improve(&ctx, session_id, "session-end").await?;
+    info!(
+        session_id = %session_id,
+        run_id = %run.run_id,
+        proposals = run.proposals,
+        approved = run.approved,
+        pending = run.pending,
+        conflicts = run.conflicts,
+        skipped = run.skipped.len(),
+        "session-end auto-improve completed"
+    );
+    for skipped in &run.skipped {
+        tracing::warn!(
+            session_id = %session_id,
+            run_id = %run.run_id,
+            target_path = %skipped.target_path,
+            reason = %skipped.reason,
+            "session-end auto-improve proposal was not staged"
+        );
+    }
+    Ok(SessionEndAutoImproveOutcome::Reviewed {
+        proposals: run.proposals,
+        approved: run.approved,
+    })
 }
 
 /// Run one cross-session ("experience") review and stage it through the
@@ -1153,7 +1269,9 @@ mod tests {
             settings: &settings,
         };
 
-        let run = run_scheduled_auto_improve(&ctx, session_id).await.unwrap();
+        let run = run_scheduled_auto_improve(&ctx, session_id, "scheduler")
+            .await
+            .unwrap();
         assert_eq!(run.proposals, 0, "the only proposal collided");
         assert_eq!(
             run.skipped.len(),
@@ -1192,6 +1310,145 @@ mod tests {
             captured.contains("scheduled auto-improve proposal was not staged")
                 && captured.contains(COLLIDING_PATH),
             "the log must name the dropped target: {captured}"
+        );
+    }
+
+    /// Build a scope whose scheduler watermark is already seeded, the way
+    /// `initialize_auto_improve_scheduler_scopes` seeds it at server startup.
+    /// A session that ends afterwards is then a candidate for both triggers.
+    async fn seeded_scope(store: &Store) -> (WorkspaceId, ProjectId) {
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+        (ws, proj)
+    }
+
+    fn session_end_settings(min_observations: usize) -> ScheduledAutoImproveSettings {
+        ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: None,
+        }
+    }
+
+    /// The `SessionEnd` trigger and the hourly scheduler write the same claim
+    /// row, so a session reviewed at its end is never reviewed a second time.
+    /// Without the shared claim the two triggers would each pay for a full
+    /// reviewer call on the same observations.
+    #[tokio::test]
+    async fn a_session_end_review_stops_the_scheduler_reviewing_the_same_session() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        // Staging a proposal writes a sidecar, which needs the store reader.
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj) = seeded_scope(&store).await;
+        let session_id = seed_reviewable_session(&store, ws, proj).await;
+        let settings = session_end_settings(3);
+        let llm: Arc<dyn LlmProvider> = Arc::new(OneProposalLlm);
+        let request = SessionEndAutoImproveRequest {
+            workspace_id: ws,
+            project_id: proj,
+            session_id,
+        };
+
+        let first = run_session_end_auto_improve(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &llm,
+            &settings,
+            request,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(first, SessionEndAutoImproveOutcome::Reviewed { .. }),
+            "the setting must actually schedule a review: {first:?}"
+        );
+
+        let repeat = run_session_end_auto_improve(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &llm,
+            &settings,
+            request,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repeat,
+            SessionEndAutoImproveOutcome::NotEligible,
+            "a redelivered SessionEnd must not buy a second review"
+        );
+
+        let tick =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(tick.errors, 0);
+        assert_eq!(
+            tick.reviewed, 0,
+            "the hourly scheduler must skip a session the SessionEnd trigger claimed"
+        );
+    }
+
+    /// The trigger changes WHEN a review starts, never WHETHER the gates
+    /// apply. `min_observations` blocks most sessions on a live store, and a
+    /// blocked session must not reach the provider.
+    #[tokio::test]
+    async fn a_session_end_review_keeps_the_observation_gate() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let (ws, proj) = seeded_scope(&store).await;
+        let session_id = seed_reviewable_session(&store, ws, proj).await;
+        // The fixture holds 3 observations; the live default is 8.
+        let settings = session_end_settings(8);
+        // Any provider call fails the test.
+        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+
+        let outcome = run_session_end_auto_improve(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &llm,
+            &settings,
+            SessionEndAutoImproveRequest {
+                workspace_id: ws,
+                project_id: proj,
+                session_id,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SessionEndAutoImproveOutcome::Reviewed {
+                proposals: 0,
+                approved: 0
+            },
+            "the gate must block the proposals, not the run bookkeeping"
         );
     }
 }

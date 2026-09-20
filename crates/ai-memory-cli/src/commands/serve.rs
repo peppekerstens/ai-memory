@@ -66,6 +66,11 @@ const SESSION_CONSOLIDATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// A claimed job may be recovered after this long without completion. Provider
 /// requests are expected to finish well inside this lease.
 const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
+/// Requests the `SessionEnd` auto-improve worker may hold before the hook path
+/// drops new ones. The worker handles one review at a time and a review is a
+/// full model call, so the queue is a short backpressure buffer, not a backlog:
+/// a dropped request leaves the session unclaimed for the hourly scheduler.
+const SESSION_END_AUTO_IMPROVE_QUEUE: usize = 32;
 
 /// Lock file guarding a data dir against a second `ai-memory serve` (#563).
 const SERVE_LOCK_FILE: &str = ".serve.lock";
@@ -846,6 +851,78 @@ async fn run_session_consolidation_worker(
     }
 }
 
+/// Decide whether `SessionEnd` hands a session to the auto-improvement
+/// reviewer, and return the provider the worker needs.
+///
+/// `[auto_improve] on_session_end` defaults to false, so an operator who sets
+/// nothing keeps the behaviour of every earlier release: only the hourly
+/// scheduler launches a review. A review is a provider call, so the trigger
+/// also stays off with no LLM provider, and says so once at startup.
+fn session_end_auto_improve_provider(
+    on_session_end: bool,
+    llm: Option<&Arc<dyn LlmProvider>>,
+) -> Option<Arc<dyn LlmProvider>> {
+    if !on_session_end {
+        return None;
+    }
+    let Some(llm) = llm else {
+        tracing::warn!(
+            "[auto_improve] on_session_end is set but no LLM provider is configured; \
+             SessionEnd reviews stay off"
+        );
+        return None;
+    };
+    Some(llm.clone())
+}
+
+/// Drain the `SessionEnd` auto-improve queue, one review at a time.
+///
+/// One review per request and one request at a time: a reviewer call is a
+/// full model call, and a burst of session ends must not open a burst of
+/// them. The hook side only ever uses `try_send`, so this worker can take as
+/// long as a review takes without holding a hook.
+async fn run_session_end_auto_improve_worker(
+    reader: ReaderPool,
+    writer: WriterHandle,
+    wiki: Wiki,
+    llm: Arc<dyn LlmProvider>,
+    settings: ScheduledAutoImproveSettings,
+    mut requests: tokio::sync::mpsc::Receiver<ai_memory_consolidate::SessionEndAutoImproveRequest>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let request = tokio::select! {
+            () = cancel.cancelled() => return,
+            request = requests.recv() => match request {
+                Some(request) => request,
+                None => return,
+            },
+        };
+        let started = std::time::Instant::now();
+        let review = ai_memory_consolidate::run_session_end_auto_improve(
+            &reader, &writer, &wiki, &llm, &settings, request,
+        );
+        tokio::pin!(review);
+        let result = tokio::select! {
+            () = cancel.cancelled() => return,
+            result = &mut review => result,
+        };
+        match result {
+            Ok(outcome) => tracing::debug!(
+                session = %request.session_id,
+                ?outcome,
+                elapsed_ms = started.elapsed().as_millis(),
+                "SessionEnd auto-improve review finished"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                session = %request.session_id,
+                "SessionEnd auto-improve review failed"
+            ),
+        }
+    }
+}
+
 /// Run the `serve` subcommand.
 ///
 /// # Errors
@@ -1132,6 +1209,32 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 } else {
                     (None, None)
                 };
+            // `[auto_improve] on_session_end`: review the session that just
+            // ended instead of waiting for the hourly tick.
+            let (auto_improve_session_end, auto_improve_session_end_task) =
+                match session_end_auto_improve_provider(
+                    config.auto_improve.on_session_end,
+                    admin_llm.as_ref(),
+                ) {
+                    Some(llm) => {
+                        let (tx, rx) = tokio::sync::mpsc::channel(SESSION_END_AUTO_IMPROVE_QUEUE);
+                        let task = tokio::spawn(run_session_end_auto_improve_worker(
+                            store.reader.clone(),
+                            store.writer.clone(),
+                            wiki.clone(),
+                            llm,
+                            scheduled_auto_improve_settings_from(&config.auto_improve),
+                            rx,
+                            cancel.child_token(),
+                        ));
+                        info!(
+                            queue = SESSION_END_AUTO_IMPROVE_QUEUE,
+                            "SessionEnd auto-improve worker started"
+                        );
+                        (Some(tx), Some(task))
+                    }
+                    None => (None, None),
+                };
             let server_clone = server.clone();
             // `Host`-header allowlist for the HTTP DNS-rebinding guard.
             // Sourced from Config (which already handles the
@@ -1207,6 +1310,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 ingest_gates: ai_memory_hooks::IngestGates::default(),
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
+                auto_improve_session_end,
                 capture_assistant_enabled: config.capture_assistant,
                 per_user_slots: config.slots.per_user,
                 subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -1533,6 +1637,21 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     ),
                 }
             }
+            if let Some(task) = auto_improve_session_end_task {
+                // Same bound, same reason: the worker can be inside a provider
+                // call that the cancellation only ends at the next await point.
+                match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "SessionEnd auto-improve worker join failed");
+                    }
+                    Err(_) => tracing::warn!(
+                        grace_secs = SHUTDOWN_GRACE.as_secs(),
+                        "SessionEnd auto-improve worker did not stop within the shutdown \
+                         grace period; exiting anyway"
+                    ),
+                }
+            }
             if let Some(serve_result) = serve_result {
                 serve_result?;
             }
@@ -1791,19 +1910,7 @@ async fn start_maintenance_scheduler(
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
-        let scheduler_settings = ScheduledAutoImproveSettings {
-            review: auto_improve_review_config_from_settings(&auto_improve),
-            require_approval: auto_improve.require_approval,
-            min_session_age_secs: scheduler.min_session_age_secs,
-            max_sessions_per_tick: scheduler.max_sessions_per_tick,
-            experience: (scheduler.experience_every_sessions > 0).then(|| {
-                ai_memory_consolidate::ExperienceConfig {
-                    sessions: scheduler.experience_sessions.max(1),
-                    min_new_sessions: scheduler.experience_every_sessions,
-                    ..ai_memory_consolidate::ExperienceConfig::default()
-                }
-            }),
-        };
+        let scheduler_settings = scheduled_auto_improve_settings_from(&auto_improve);
         match ai_memory_consolidate::initialize_auto_improve_scheduler_scopes(&reader, &writer)
             .await
         {
@@ -2026,6 +2133,30 @@ async fn run_scheduled_embedding_backfill_tick(
     }
 
     Ok(outcome)
+}
+
+/// Map `[auto_improve]` onto the scheduled-review settings.
+///
+/// The hourly tick and the `SessionEnd` trigger share this, so the gates
+/// (`min_observations`, `min_session_duration_secs`, `min_confidence`) and the
+/// approval behaviour cannot drift between the two paths.
+fn scheduled_auto_improve_settings_from(
+    settings: &AutoImproveSettings,
+) -> ScheduledAutoImproveSettings {
+    let scheduler = &settings.scheduler;
+    ScheduledAutoImproveSettings {
+        review: auto_improve_review_config_from_settings(settings),
+        require_approval: settings.require_approval,
+        min_session_age_secs: scheduler.min_session_age_secs,
+        max_sessions_per_tick: scheduler.max_sessions_per_tick,
+        experience: (scheduler.experience_every_sessions > 0).then(|| {
+            ai_memory_consolidate::ExperienceConfig {
+                sessions: scheduler.experience_sessions.max(1),
+                min_new_sessions: scheduler.experience_every_sessions,
+                ..ai_memory_consolidate::ExperienceConfig::default()
+            }
+        }),
+    }
 }
 
 fn auto_improve_review_config_from_settings(
@@ -3199,6 +3330,36 @@ mod tests {
                 task.abort();
             }
         }
+    }
+
+    /// `[auto_improve] on_session_end` defaults to false. An operator who
+    /// sets nothing must get byte-identical behaviour, so the default must
+    /// arm no reviewer at all.
+    #[test]
+    fn session_end_auto_improve_stays_off_by_default() {
+        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        assert!(
+            session_end_auto_improve_provider(false, Some(&llm)).is_none(),
+            "the default must not arm the SessionEnd reviewer"
+        );
+    }
+
+    /// A review is a provider call. With the setting on and no provider the
+    /// trigger stays off instead of arming a worker that can do nothing.
+    #[test]
+    fn session_end_auto_improve_needs_a_provider() {
+        assert!(session_end_auto_improve_provider(true, None).is_none());
+    }
+
+    /// The setting is wired: on, with a provider, it arms the reviewer.
+    /// Before this fix the value was read nowhere and this returned nothing.
+    #[test]
+    fn session_end_auto_improve_arms_with_the_setting_and_a_provider() {
+        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        assert!(
+            session_end_auto_improve_provider(true, Some(&llm)).is_some(),
+            "on_session_end must reach the SessionEnd path"
+        );
     }
 
     struct PanicLlm;
