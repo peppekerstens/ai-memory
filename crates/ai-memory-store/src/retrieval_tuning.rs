@@ -21,6 +21,20 @@
 //!
 //! Both signals are reported in `SearchExplain`, so an `explain=true`
 //! query can account for the returned rank.
+//!
+//! The same struct carries two **payload width** tunables. They do not
+//! change the rank of any hit. They change how much text each hit shows:
+//!
+//! * **Snippet tokens** — the last argument of the FTS5 `snippet()` calls
+//!   that build the excerpt of a lexical hit. FTS5 accepts 1 to 64.
+//! * **Descriptor characters** — the budget of [`page_descriptor`], the
+//!   excerpt of a vector, entity, graph-neighbour or recency hit, which
+//!   has no matched term to centre on.
+//!
+//! Both defaults keep the payload byte-identical to a store that never
+//! configures them.
+//!
+//! [`page_descriptor`]: crate::reader
 
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +50,30 @@ pub struct RetrievalTuning {
     /// Add the L0 abstract-embedding stream to the RRF fusion. Reads
     /// `page_abstract_embeddings`; contributes nothing while it is empty.
     pub abstract_vectors: bool,
+    /// Token budget of the FTS5 `snippet()` excerpt on a lexical hit.
+    /// FTS5 accepts 1 to 64 and fails the query outside that range, so
+    /// [`RetrievalTuning::sanitised`] clamps the value.
+    pub snippet_tokens: usize,
+    /// Character budget of the synthesised descriptor on a vector, entity,
+    /// graph-neighbour or recency hit. Clamped to
+    /// [`DESCRIPTOR_CHARS_MIN`]..=[`DESCRIPTOR_CHARS_MAX`].
+    pub descriptor_chars: usize,
 }
+
+/// Lowest FTS5 snippet token budget.
+pub const SNIPPET_TOKENS_MIN: usize = 1;
+/// Highest FTS5 snippet token budget. The FTS5 `snippet()` function fails
+/// the whole query above this number.
+pub const SNIPPET_TOKENS_MAX: usize = 64;
+/// Default FTS5 snippet token budget. Keeps the shipped payload size.
+pub const SNIPPET_TOKENS_DEFAULT: usize = 24;
+/// Lowest page descriptor budget, in characters.
+pub const DESCRIPTOR_CHARS_MIN: usize = 80;
+/// Highest page descriptor budget, in characters. A descriptor is one hit
+/// of a multi-hit answer, so this bounds the payload of the whole answer.
+pub const DESCRIPTOR_CHARS_MAX: usize = 2_000;
+/// Default page descriptor budget. Keeps the shipped payload size.
+pub const DESCRIPTOR_CHARS_DEFAULT: usize = 240;
 
 impl Default for RetrievalTuning {
     fn default() -> Self {
@@ -50,6 +87,28 @@ impl Default for RetrievalTuning {
             // matters more than session recall.
             session_recall_bonus: 0.25,
             abstract_vectors: false,
+            snippet_tokens: SNIPPET_TOKENS_DEFAULT,
+            descriptor_chars: DESCRIPTOR_CHARS_DEFAULT,
+        }
+    }
+}
+
+impl RetrievalTuning {
+    /// A copy with every payload width inside its supported range.
+    ///
+    /// The store calls this on the value it receives, so a bad number from
+    /// a config file or an env var narrows the excerpt instead of failing
+    /// every lexical query at SQL level.
+    #[must_use]
+    pub fn sanitised(self) -> Self {
+        Self {
+            snippet_tokens: self
+                .snippet_tokens
+                .clamp(SNIPPET_TOKENS_MIN, SNIPPET_TOKENS_MAX),
+            descriptor_chars: self
+                .descriptor_chars
+                .clamp(DESCRIPTOR_CHARS_MIN, DESCRIPTOR_CHARS_MAX),
+            ..self
         }
     }
 }
@@ -140,6 +199,41 @@ mod tests {
         let t = RetrievalTuning::default();
         assert!(!t.session_recall_routing);
         assert!(!t.abstract_vectors);
+        assert_eq!(t.snippet_tokens, SNIPPET_TOKENS_DEFAULT);
+        assert_eq!(t.descriptor_chars, DESCRIPTOR_CHARS_DEFAULT);
+    }
+
+    #[test]
+    fn payload_widths_are_clamped_to_the_supported_range() {
+        let wide = RetrievalTuning {
+            snippet_tokens: 4_000,
+            descriptor_chars: 40_000,
+            ..RetrievalTuning::default()
+        }
+        .sanitised();
+        assert_eq!(wide.snippet_tokens, SNIPPET_TOKENS_MAX);
+        assert_eq!(wide.descriptor_chars, DESCRIPTOR_CHARS_MAX);
+
+        let narrow = RetrievalTuning {
+            snippet_tokens: 0,
+            descriptor_chars: 1,
+            ..RetrievalTuning::default()
+        }
+        .sanitised();
+        assert_eq!(narrow.snippet_tokens, SNIPPET_TOKENS_MIN);
+        assert_eq!(narrow.descriptor_chars, DESCRIPTOR_CHARS_MIN);
+    }
+
+    #[test]
+    fn sanitised_keeps_a_supported_value() {
+        let t = RetrievalTuning {
+            snippet_tokens: 48,
+            descriptor_chars: 400,
+            ..RetrievalTuning::default()
+        }
+        .sanitised();
+        assert_eq!(t.snippet_tokens, 48);
+        assert_eq!(t.descriptor_chars, 400);
     }
 
     #[test]

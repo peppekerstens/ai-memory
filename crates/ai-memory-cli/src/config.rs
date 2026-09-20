@@ -1028,11 +1028,14 @@ impl Default for MaintenanceSettings {
 }
 
 /// `[retrieval]` opt-in ranking signals layered on the RRF fusion in
-/// `memory_query`. Every default leaves ranking byte-identical to a store
-/// that never heard of this section.
+/// `memory_query`, plus the two payload widths of an answer. Every default
+/// leaves ranking and payload byte-identical to a store that never heard of
+/// this section.
 ///
 /// Env form: `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`,
-/// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`.
+/// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`,
+/// `AI_MEMORY_RETRIEVAL__SNIPPET_TOKENS=48`,
+/// `AI_MEMORY_RETRIEVAL__DESCRIPTOR_CHARS=400`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrievalSettings {
@@ -1048,6 +1051,15 @@ pub struct RetrievalSettings {
     /// the RRF fusion. Pages gain an abstract vector when their frontmatter
     /// carries `abstract:` and the embedding backfill runs.
     pub abstract_vectors: bool,
+    /// Width of the excerpt around the matched terms of a lexical hit, in
+    /// FTS5 tokens. FTS5 accepts 1 to 64. A wider excerpt raises the answer
+    /// rate on pages that already rank first, because the answer can sit
+    /// outside a narrow excerpt. It also grows the payload.
+    pub snippet_tokens: usize,
+    /// Width of the descriptor of a vector, entity, graph-neighbour or
+    /// recency hit, in characters. These hits have no matched term to
+    /// centre an excerpt on. Accepts 80 to 2000.
+    pub descriptor_chars: usize,
 }
 
 impl Default for RetrievalSettings {
@@ -1057,6 +1069,8 @@ impl Default for RetrievalSettings {
             query_intent: base.session_recall_routing,
             session_recall_bonus: base.session_recall_bonus,
             abstract_vectors: base.abstract_vectors,
+            snippet_tokens: base.snippet_tokens,
+            descriptor_chars: base.descriptor_chars,
         }
     }
 }
@@ -1069,7 +1083,10 @@ impl RetrievalSettings {
             session_recall_routing: self.query_intent,
             session_recall_bonus: self.session_recall_bonus.max(0.0),
             abstract_vectors: self.abstract_vectors,
+            snippet_tokens: self.snippet_tokens,
+            descriptor_chars: self.descriptor_chars,
         }
+        .sanitised()
     }
 }
 
@@ -1162,6 +1179,31 @@ impl Config {
         }
         if config.decay.observation_prune_batch == 0 {
             anyhow::bail!("decay.observation_prune_batch must be greater than zero");
+        }
+
+        // Fail at startup rather than silently narrowing the answer: an
+        // operator who widened the payload must see the number the server
+        // uses. FTS5 rejects a snippet budget above 64 at query time, which
+        // would break every lexical query instead of one setting.
+        if !(ai_memory_store::SNIPPET_TOKENS_MIN..=ai_memory_store::SNIPPET_TOKENS_MAX)
+            .contains(&config.retrieval.snippet_tokens)
+        {
+            anyhow::bail!(
+                "retrieval.snippet_tokens must be {} to {} (got {}); FTS5 accepts no more",
+                ai_memory_store::SNIPPET_TOKENS_MIN,
+                ai_memory_store::SNIPPET_TOKENS_MAX,
+                config.retrieval.snippet_tokens
+            );
+        }
+        if !(ai_memory_store::DESCRIPTOR_CHARS_MIN..=ai_memory_store::DESCRIPTOR_CHARS_MAX)
+            .contains(&config.retrieval.descriptor_chars)
+        {
+            anyhow::bail!(
+                "retrieval.descriptor_chars must be {} to {} (got {})",
+                ai_memory_store::DESCRIPTOR_CHARS_MIN,
+                ai_memory_store::DESCRIPTOR_CHARS_MAX,
+                config.retrieval.descriptor_chars
+            );
         }
 
         // Fail at startup rather than shipping a prompt that is all scaffolding

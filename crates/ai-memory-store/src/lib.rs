@@ -70,7 +70,10 @@ pub use reader::{
     StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow,
     WorkspaceSummary, f32_vec_to_bytes,
 };
-pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
+pub use retrieval_tuning::{
+    DESCRIPTOR_CHARS_DEFAULT, DESCRIPTOR_CHARS_MAX, DESCRIPTOR_CHARS_MIN, RetrievalTuning,
+    SNIPPET_TOKENS_DEFAULT, SNIPPET_TOKENS_MAX, SNIPPET_TOKENS_MIN, is_session_recall_query,
+};
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
     create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,

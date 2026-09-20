@@ -77,23 +77,34 @@ fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
     )
 }
 
-/// Leading body characters scanned when a page carries no frontmatter
-/// `summary`. Wide enough to step past the `# Title` line and a structural
-/// heading or two before the first real prose.
-const DESCRIPTOR_SCAN_CHARS: usize = 600;
+/// Leading body characters scanned per descriptor character, when a page
+/// carries no frontmatter `summary`. The scan must be wider than the budget
+/// it feeds, so the descriptor can step past the `# Title` line and a
+/// structural heading or two before the first real prose.
+const DESCRIPTOR_SCAN_RATIO: usize = 5;
+/// Denominator of [`DESCRIPTOR_SCAN_RATIO`]. The pair keeps the shipped
+/// 240-character budget on its shipped 600-character scan.
+const DESCRIPTOR_SCAN_DIVISOR: usize = 2;
 
-/// Maximum length of a synthesised page descriptor, in characters.
-const DESCRIPTOR_MAX_CHARS: usize = 240;
+/// Leading body characters to scan for a descriptor of `max_chars`.
+fn descriptor_scan_chars(max_chars: usize) -> usize {
+    max_chars.saturating_mul(DESCRIPTOR_SCAN_RATIO) / DESCRIPTOR_SCAN_DIVISOR
+}
 
 /// SQL expression yielding the raw material for [`page_descriptor`]: the
 /// page's own frontmatter `summary` when it has a non-blank one, otherwise a
 /// prefix of the body. `NULLIF(TRIM(...), '')` keeps an empty summary from
 /// winning the `COALESCE` over real body text.
-fn page_descriptor_expr(body_column: &str, frontmatter_column: &str) -> String {
+fn page_descriptor_expr(
+    body_column: &str,
+    frontmatter_column: &str,
+    descriptor_chars: usize,
+) -> String {
+    let scan = descriptor_scan_chars(descriptor_chars);
     format!(
         "COALESCE( \
             NULLIF(TRIM(json_extract({frontmatter_column}, '$.summary')), ''), \
-            substr({body_column}, 1, {DESCRIPTOR_SCAN_CHARS}) \
+            substr({body_column}, 1, {scan}) \
         )"
     )
 }
@@ -131,12 +142,12 @@ fn is_metadata_bullet(line: &str) -> bool {
 /// the `## Session metadata` block under it — the title the hit already
 /// carries, followed by a session id and three timestamps.
 ///
-/// Fills the [`DESCRIPTOR_MAX_CHARS`] budget from the page's own text,
+/// Fills the [`DESCRIPTOR_CHARS_DEFAULT`] budget from the page's own text,
 /// skipping four things that carry no signal for the reader deciding whether
 /// to open the page: structural lines, metadata bullets, and any line that
 /// merely repeats `title`. On a session page that lands on the prompts after
 /// the first, which is the part `title` does not already show.
-fn page_descriptor(raw: &str, title: &str) -> String {
+fn page_descriptor(raw: &str, title: &str, max_chars: usize) -> String {
     // `truncate_for_title` suffixes an ellipsis only when it shortened the
     // title, so an ellipsis-free title is complete: a longer line that merely
     // opens with it is a different sentence and must be kept.
@@ -168,20 +179,20 @@ fn page_descriptor(raw: &str, title: &str) -> String {
             continue;
         }
         if !out.is_empty() {
-            if out.chars().count() + 1 + content.chars().count() > DESCRIPTOR_MAX_CHARS {
+            if out.chars().count() + 1 + content.chars().count() > max_chars {
                 break;
             }
             out.push(' ');
         }
         out.push_str(content);
-        if out.chars().count() >= DESCRIPTOR_MAX_CHARS {
+        if out.chars().count() >= max_chars {
             break;
         }
     }
     if out.is_empty() {
-        return truncate_chars(raw.trim(), DESCRIPTOR_MAX_CHARS);
+        return truncate_chars(raw.trim(), max_chars);
     }
-    truncate_chars(&out, DESCRIPTOR_MAX_CHARS)
+    truncate_chars(&out, max_chars)
 }
 
 /// Truncate on a character boundary, marking elision with an ellipsis.
@@ -1524,7 +1535,7 @@ impl ReaderPool {
     /// Configure the opt-in ranking signals used by [`Self::hybrid_search`].
     /// Only handles cloned from this one afterwards observe the change.
     pub fn set_retrieval_tuning(&mut self, tuning: RetrievalTuning) {
-        self.tuning = tuning;
+        self.tuning = tuning.sanitised();
     }
 
     /// The ranking signals this handle applies (default: none).
@@ -1623,11 +1634,12 @@ impl ReaderPool {
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let snippet_tokens = self.tuning.snippet_tokens;
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title, \
-                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', {snippet_tokens}) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
@@ -1705,11 +1717,12 @@ impl ReaderPool {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let snippet_tokens = self.tuning.snippet_tokens;
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
-                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', {snippet_tokens}) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
@@ -1829,11 +1842,12 @@ impl ReaderPool {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let snippet_tokens = self.tuning.snippet_tokens;
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title, \
-                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', {snippet_tokens}) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
@@ -1922,11 +1936,12 @@ impl ReaderPool {
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
+        let snippet_tokens = self.tuning.snippet_tokens;
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title, \
-                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', {snippet_tokens}) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
@@ -2158,11 +2173,13 @@ impl ReaderPool {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
+        let snippet_tokens = self.tuning.snippet_tokens;
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
+            let sql = format!(
                 "SELECT observations.id, observations.session_id, observations.kind, \
                         observations.title, \
-                        snippet(observations_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        snippet(observations_fts, 1, '<mark>', '</mark>', '…', {snippet_tokens}) \
+                        AS snip, \
                         observations_fts.rank, observations.created_at \
                  FROM observations_fts \
                  JOIN observations ON observations.rowid = observations_fts.rowid \
@@ -2170,8 +2187,9 @@ impl ReaderPool {
                    AND observations.workspace_id = ?2 \
                    AND observations.project_id = ?3 \
                  ORDER BY observations_fts.rank \
-                 LIMIT ?4",
-            )?;
+                 LIMIT ?4"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
             let rows = stmt.query_map(
                 params![
@@ -2226,6 +2244,7 @@ impl ReaderPool {
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn recent_pages(&self, limit: usize) -> StoreResult<Vec<PageHit>> {
+        let descriptor_chars = self.tuning.descriptor_chars;
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT id, path, title, \
@@ -2235,7 +2254,7 @@ impl ReaderPool {
                  WHERE is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?1",
-                descriptor = page_descriptor_expr("body", "frontmatter_json"),
+                descriptor = page_descriptor_expr("body", "frontmatter_json", descriptor_chars),
                 not_expired = not_expired("pages", "?2"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -2244,7 +2263,7 @@ impl ReaderPool {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
-                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
+                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title, descriptor_chars);
                 let rank: f64 = row.get(4)?;
                 Ok((id_bytes, path, title, snippet, rank))
             })?;
@@ -2274,6 +2293,7 @@ impl ReaderPool {
         project_id: ProjectId,
         limit: usize,
     ) -> StoreResult<Vec<PageHit>> {
+        let descriptor_chars = self.tuning.descriptor_chars;
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT id, path, title, \
@@ -2283,7 +2303,7 @@ impl ReaderPool {
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
-                descriptor = page_descriptor_expr("body", "frontmatter_json"),
+                descriptor = page_descriptor_expr("body", "frontmatter_json", descriptor_chars),
                 not_expired = not_expired("pages", "?4"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -2299,7 +2319,8 @@ impl ReaderPool {
                     let id_bytes: Vec<u8> = row.get(0)?;
                     let path: String = row.get(1)?;
                     let title: String = row.get(2)?;
-                    let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
+                    let snippet =
+                        page_descriptor(&row.get::<_, String>(3)?, &title, descriptor_chars);
                     let rank: f64 = row.get(4)?;
                     Ok((id_bytes, path, title, snippet, rank))
                 },
@@ -2333,6 +2354,7 @@ impl ReaderPool {
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn recent_pages_global(&self, limit: usize) -> StoreResult<Vec<PageHitWithMeta>> {
+        let descriptor_chars = self.tuning.descriptor_chars;
         self.with_conn(move |conn| {
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
@@ -2344,7 +2366,8 @@ impl ReaderPool {
                  WHERE pages.is_latest = 1{not_expired} \
                  ORDER BY pages.updated_at DESC \
                  LIMIT ?1",
-                descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
+                descriptor =
+                    page_descriptor_expr("pages.body", "pages.frontmatter_json", descriptor_chars),
                 not_expired = not_expired("pages", "?2"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -2354,7 +2377,7 @@ impl ReaderPool {
                 let project_name: String = row.get(1)?;
                 let path: String = row.get(2)?;
                 let title: String = row.get(3)?;
-                let snippet = page_descriptor(&row.get::<_, String>(4)?, &title);
+                let snippet = page_descriptor(&row.get::<_, String>(4)?, &title, descriptor_chars);
                 let rank: f64 = row.get(5)?;
                 Ok((workspace_name, project_name, path, title, snippet, rank))
             })?;
@@ -4040,6 +4063,7 @@ impl ReaderPool {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let descriptor_chars = self.tuning.descriptor_chars;
         self.with_conn(move |conn| {
             let mut placeholders = String::with_capacity(tokens.len() * 96);
             let mut sql_params: Vec<Value> = Vec::with_capacity(tokens.len() * 5 + 7);
@@ -4116,7 +4140,8 @@ impl ReaderPool {
                  GROUP BY pg.id, pg.path, pg.title \
                  ORDER BY weight DESC, matches DESC, pg.path ASC \
                  LIMIT ?",
-                descriptor = page_descriptor_expr("pg.body", "pg.frontmatter_json"),
+                descriptor =
+                    page_descriptor_expr("pg.body", "pg.frontmatter_json", descriptor_chars),
                 version_filter = if as_of_us.is_some() {
                     // Window containment (docs/temporal.md); no expiry.
                     " AND l.valid_from <= ? \
@@ -4140,7 +4165,7 @@ impl ReaderPool {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
-                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
+                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title, descriptor_chars);
                 let weight: f64 = row.get(4)?;
                 let names_json: String = row.get(6)?;
                 Ok((id_bytes, path, title, snippet, weight, names_json))
@@ -4270,6 +4295,7 @@ impl ReaderPool {
             return Ok(Vec::new());
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        let descriptor_chars = self.tuning.descriptor_chars;
         self.with_conn(move |conn| {
             let mut seen = std::collections::HashSet::new();
             let mut out = Vec::new();
@@ -4292,8 +4318,10 @@ impl ReaderPool {
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
             sql_params.push(Value::Integer(now));
 
-            let out_descriptor = page_descriptor_expr("tp.body", "tp.frontmatter_json");
-            let in_descriptor = page_descriptor_expr("fp.body", "fp.frontmatter_json");
+            let out_descriptor =
+                page_descriptor_expr("tp.body", "tp.frontmatter_json", descriptor_chars);
+            let in_descriptor =
+                page_descriptor_expr("fp.body", "fp.frontmatter_json", descriptor_chars);
             let out_not_expired = not_expired("tp", "?");
             let in_not_expired = not_expired("fp", "?");
             let mut sql = String::with_capacity(values_clause.len() + 1_500);
@@ -4331,7 +4359,7 @@ impl ReaderPool {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
-                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
+                let snippet = page_descriptor(&row.get::<_, String>(3)?, &title, descriptor_chars);
                 let stream_ord: i64 = row.get(4)?;
                 let link_type: String = row.get(5)?;
                 Ok((id_bytes, path, title, snippet, stream_ord, link_type))
@@ -4447,6 +4475,7 @@ impl ReaderPool {
         if page_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        let descriptor_chars = self.tuning.descriptor_chars;
         self.with_conn(move |conn| {
             let mut values_clause = String::with_capacity(page_ids.len() * 5);
             let mut sql_params = Vec::with_capacity(page_ids.len() + 2);
@@ -4468,7 +4497,8 @@ impl ReaderPool {
                  WHERE pages.workspace_id = ? \
                    AND pages.project_id = ? \
                    AND pages.is_latest = 1",
-                descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
+                descriptor =
+                    page_descriptor_expr("pages.body", "pages.frontmatter_json", descriptor_chars),
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
@@ -9383,10 +9413,11 @@ mod tests {
     }
 
     use super::{
-        DESCRIPTOR_MAX_CHARS, StorageStatus, entity_query_tokens, handoff_listing_sql, like_escape,
-        page_descriptor, page_descriptor_expr,
+        StorageStatus, descriptor_scan_chars, entity_query_tokens, handoff_listing_sql,
+        like_escape, page_descriptor, page_descriptor_expr,
     };
     use crate::Store;
+    use crate::retrieval_tuning::DESCRIPTOR_CHARS_DEFAULT;
 
     #[test]
     fn a_metadata_styled_descriptor_source_is_echoed_verbatim() {
@@ -9401,7 +9432,7 @@ mod tests {
         // anywhere reports an error. Writers must emit plain prose.
         let metadata_styled = "- **session_id:** `9f2c`\n- **observations:** 2";
         assert_eq!(
-            page_descriptor(metadata_styled, "Some title"),
+            page_descriptor(metadata_styled, "Some title", DESCRIPTOR_CHARS_DEFAULT),
             metadata_styled
         );
     }
@@ -10111,7 +10142,7 @@ mod tests {
             "Switched the scheduler to a single writer actor.\n",
         );
         assert_eq!(
-            page_descriptor(body, ""),
+            page_descriptor(body, "", DESCRIPTOR_CHARS_DEFAULT),
             "Switched the scheduler to a single writer actor."
         );
     }
@@ -10131,7 +10162,7 @@ mod tests {
             "Episodic page sessions/e24f6fbc.md is 30 days old with zero accesses.\n",
         );
         assert_eq!(
-            page_descriptor(body, ""),
+            page_descriptor(body, "", DESCRIPTOR_CHARS_DEFAULT),
             "501 finding(s). Episodic page sessions/e24f6fbc.md is 30 days old \
              with zero accesses."
         );
@@ -10139,8 +10170,11 @@ mod tests {
 
     #[test]
     fn page_descriptor_falls_back_to_raw_text_when_all_lines_are_structural() {
-        assert_eq!(page_descriptor("# Only a title\n", ""), "# Only a title");
-        assert_eq!(page_descriptor("   ", ""), "");
+        assert_eq!(
+            page_descriptor("# Only a title\n", "", DESCRIPTOR_CHARS_DEFAULT),
+            "# Only a title"
+        );
+        assert_eq!(page_descriptor("   ", "", DESCRIPTOR_CHARS_DEFAULT), "");
     }
 
     #[test]
@@ -10164,7 +10198,7 @@ mod tests {
             "2. o rollback falhou no passo do migrate\n",
         );
         assert_eq!(
-            page_descriptor(body, title),
+            page_descriptor(body, title, DESCRIPTOR_CHARS_DEFAULT),
             "o rollback falhou no passo do migrate"
         );
     }
@@ -10177,7 +10211,7 @@ mod tests {
         let title = "vamos revisar o deploy";
         let body = "# vamos revisar o deploy\n\n1. vamos revisar o deploy\n2. vamos revisar o deploy e o rollback do migrate\n";
         assert_eq!(
-            page_descriptor(body, title),
+            page_descriptor(body, title, DESCRIPTOR_CHARS_DEFAULT),
             "vamos revisar o deploy e o rollback do migrate"
         );
     }
@@ -10186,22 +10220,41 @@ mod tests {
     fn page_descriptor_matches_a_title_truncated_with_an_ellipsis() {
         let title = "vamos revisar o deploy do SHVIA-WEB e o rollback\u{2026}";
         let body = "# x\n\n1. vamos revisar o deploy do SHVIA-WEB e o rollback do migrate\n2. depois o resto\n";
-        assert_eq!(page_descriptor(body, title), "depois o resto");
+        assert_eq!(
+            page_descriptor(body, title, DESCRIPTOR_CHARS_DEFAULT),
+            "depois o resto"
+        );
     }
 
     #[test]
     fn page_descriptor_truncates_on_a_character_boundary() {
-        let body = "\u{e7}".repeat(DESCRIPTOR_MAX_CHARS + 10);
-        let out = page_descriptor(&body, "");
-        assert_eq!(out.chars().count(), DESCRIPTOR_MAX_CHARS);
+        let body = "\u{e7}".repeat(DESCRIPTOR_CHARS_DEFAULT + 10);
+        let out = page_descriptor(&body, "", DESCRIPTOR_CHARS_DEFAULT);
+        assert_eq!(out.chars().count(), DESCRIPTOR_CHARS_DEFAULT);
         assert!(out.ends_with('\u{2026}'));
     }
 
     #[test]
     fn page_descriptor_expr_prefers_a_non_blank_frontmatter_summary() {
-        let sql = page_descriptor_expr("pages.body", "pages.frontmatter_json");
+        let sql = page_descriptor_expr(
+            "pages.body",
+            "pages.frontmatter_json",
+            DESCRIPTOR_CHARS_DEFAULT,
+        );
         assert!(sql.contains("json_extract(pages.frontmatter_json, '$.summary')"));
         assert!(sql.contains("NULLIF(TRIM("));
         assert!(sql.contains("substr(pages.body, 1, 600)"));
+    }
+
+    #[test]
+    fn a_wider_budget_widens_the_descriptor_and_its_scan() {
+        let body = "x".repeat(2_000);
+        assert_eq!(page_descriptor(&body, "", 240).chars().count(), 240);
+        assert_eq!(page_descriptor(&body, "", 600).chars().count(), 600);
+        // The SQL prefix must stay wider than the budget it feeds.
+        assert_eq!(descriptor_scan_chars(240), 600);
+        assert_eq!(descriptor_scan_chars(600), 1_500);
+        let sql = page_descriptor_expr("pages.body", "pages.frontmatter_json", 600);
+        assert!(sql.contains("substr(pages.body, 1, 1500)"));
     }
 }
