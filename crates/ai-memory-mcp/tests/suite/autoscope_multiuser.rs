@@ -175,6 +175,7 @@ impl MultiUserHarness {
             ingest_gates: ai_memory_hooks::IngestGates::default(),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
+            auto_improve_session_end: None,
             capture_assistant_enabled: false,
             per_user_slots: false,
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),

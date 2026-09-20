@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `[auto_improve] on_session_end` now does what its documentation promised.
+  `config.rs` declared the field, gave it a default and tested it, and no other
+  crate read it. An operator who set
+  `AI_MEMORY_AUTO_IMPROVE__ON_SESSION_END=true` got no review at session end.
+  With the setting on and an LLM provider configured, the `SessionEnd` hook
+  hands the session that just ended to a background reviewer. The hook uses a
+  bounded queue and returns at once, so it stays cheap. The reviewer writes the
+  same per-session claim row the hourly scheduler writes, so the two triggers
+  never review one session twice. The reviewer also applies the same
+  `min_observations`, `min_session_duration_secs` and `min_confidence` gates.
+  The default stays false (#2).
+
 ## [2.3.2] - 2026-09-20
 
 ### Changed

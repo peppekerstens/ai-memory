@@ -587,6 +587,7 @@ max_output_tokens = 32000          # provider generation limit; min 1000
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review
+on_session_end = false             # true also reviews a session at SessionEnd
 min_observations = 8
 min_session_duration_secs = 120
 min_confidence = 0.75

@@ -338,6 +338,7 @@ The exact names can change, but the shape should be explicit and conservative:
 ```toml
 [auto_improve]
 require_approval = false      # true leaves proposals pending for manual review
+on_session_end = false        # true also reviews each session when it ends
 min_observations = 8
 min_session_duration_secs = 120
 min_confidence = 0.75
@@ -369,6 +370,17 @@ min_session_age_secs = 600
 background review. `[auto_improve] require_approval` controls whether validated
 proposals are applied automatically or left pending. They intentionally do not
 imply each other.
+
+`[auto_improve] on_session_end` adds a second trigger. With it on, the
+`SessionEnd` hook hands the session that just ended to a background reviewer.
+A durable page from the work of today then does not wait for the tick. The
+hook only hands the session over and returns. It never waits for the reviewer,
+and it drops the request when the reviewer is busy.
+
+Both triggers write the same per-session claim row, so the tick skips a
+session the trigger already claimed. Both triggers also use the same
+`min_observations`, `min_session_duration_secs` and `min_confidence` gates.
+The trigger needs an LLM provider and defaults to off.
 
 `max_rejection_context` and `rejection_context_days` bound the persistent
 rejection-buffer summary included in future reviewer prompts. The buffer is
