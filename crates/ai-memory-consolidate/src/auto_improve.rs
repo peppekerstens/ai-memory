@@ -295,7 +295,17 @@ pub struct AutoImproveProposal {
     #[serde(default, alias = "body", alias = "markdown", alias = "content")]
     pub body_markdown: String,
     /// `full_page` (default) or `patch`.
+    ///
+    /// The `schemars` enum makes a provider with constrained decoding emit one
+    /// of the two values. Without it the local model writes `"full"`, every
+    /// proposal dies at `unsupported_edit_mode`, and the learning loop stores
+    /// nothing. Measured 2026-09-20: 0 proposals after 158 runs, 25 of them
+    /// rejected on this field alone. Same failure shape as #458 on `operation`.
+    /// The field stays a `String`, so a provider without constrained decoding
+    /// gets normalised by [`normalize_edit_mode`] instead of failing to
+    /// deserialise and taking the whole proposal with it.
     #[serde(default = "default_edit_mode")]
+    #[schemars(extend("enum" = ["full_page", "patch"]))]
     pub edit_mode: String,
     /// Patch edits for existing _rules/ or procedures/ pages.
     #[serde(default)]
@@ -328,6 +338,9 @@ pub struct AutoImprovePatchEdit {
 /// The one operation this pipeline performs.
 pub const CANONICAL_OPERATION: &str = "create_or_update";
 
+/// The only edit mode that writes a whole page.
+pub const CANONICAL_EDIT_MODE: &str = "full_page";
+
 fn default_operation() -> String {
     CANONICAL_OPERATION.into()
 }
@@ -355,7 +368,28 @@ fn normalize_operation(raw: &str) -> String {
 }
 
 fn default_edit_mode() -> String {
-    "full_page".into()
+    CANONICAL_EDIT_MODE.into()
+}
+
+/// Folds the common spellings of the full-page edit mode into the canonical
+/// form.
+///
+/// Deliberately narrow, the same rule as [`normalize_operation`]: only
+/// spellings that unambiguously mean one of the two real modes are folded in.
+/// Anything else is left untouched, so it still fails validation.
+fn normalize_edit_mode(raw: &str) -> String {
+    let squashed: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-' | '/'))
+        .collect();
+    match squashed.as_str() {
+        "fullpage" | "full" | "whole" | "wholepage" | "page" | "replace" | "rewrite"
+        | "createorupdate" => CANONICAL_EDIT_MODE.to_string(),
+        "patch" | "patchedits" | "edits" => "patch".to_string(),
+        _ => raw.to_string(),
+    }
 }
 
 /// A candidate the reviewer or validator rejected.
@@ -1473,6 +1507,8 @@ fn normalize_proposal(proposal: &mut AutoImproveProposal, warnings: &mut Vec<Str
 
     if proposal.edit_mode.trim().is_empty() {
         proposal.edit_mode = default_edit_mode();
+    } else {
+        proposal.edit_mode = normalize_edit_mode(&proposal.edit_mode);
     }
     if proposal.edit_mode == "patch" {
         return;
@@ -3434,5 +3470,101 @@ mod operation_normalization_tests {
             serde_json::from_value(serde_json::json!({ "operation": "create" }))
                 .expect("must not fail to parse; normalisation happens in validation");
         assert_eq!(parsed.operation, "create");
+    }
+}
+
+#[cfg(test)]
+mod edit_mode_normalization_tests {
+    use super::*;
+
+    /// Measured 2026-09-20 on a live store: the local model wrote `"full"` for
+    /// every candidate, so `validate_proposal` rejected each one as
+    /// `unsupported_edit_mode`. The table held 0 proposals after 158 runs.
+    /// Same failure shape as #458 on `operation`.
+    #[test]
+    fn the_spellings_models_actually_emit_are_accepted() {
+        for raw in [
+            "full_page",
+            "full",
+            "full page",
+            "whole",
+            "whole_page",
+            "page",
+            "replace",
+            "rewrite",
+            "FULL",
+            "  Full_Page  ",
+        ] {
+            assert_eq!(
+                normalize_edit_mode(raw),
+                CANONICAL_EDIT_MODE,
+                "{raw:?} means write the whole page and must normalise"
+            );
+        }
+    }
+
+    /// The patch mode is a real second mode. It must survive untouched.
+    #[test]
+    fn patch_stays_patch() {
+        assert_eq!(normalize_edit_mode("patch"), "patch");
+        assert_eq!(normalize_edit_mode("  PATCH  "), "patch");
+    }
+
+    /// The normaliser must not become a rubber stamp.
+    #[test]
+    fn modes_we_cannot_perform_are_left_to_fail() {
+        for raw in ["delete", "append_only", "diff", "merge"] {
+            assert_ne!(
+                normalize_edit_mode(raw),
+                CANONICAL_EDIT_MODE,
+                "{raw:?} is not a whole-page write and must keep failing validation"
+            );
+        }
+    }
+
+    /// The schema must advertise the constraint, so a provider with
+    /// constrained decoding cannot generate a bad value in the first place.
+    #[test]
+    fn schema_constrains_edit_mode_to_the_two_real_modes() {
+        let schema = schemars::schema_for!(AutoImproveProposal);
+        let value = serde_json::to_value(&schema).expect("schema serialises");
+        let field = value
+            .pointer("/properties/edit_mode")
+            .expect("edit_mode property present");
+        let variants = field
+            .get("enum")
+            .and_then(|e| e.as_array())
+            .expect("edit_mode carries an enum constraint");
+        assert_eq!(
+            variants,
+            &vec![
+                serde_json::json!(CANONICAL_EDIT_MODE),
+                serde_json::json!("patch")
+            ]
+        );
+    }
+
+    /// A `String` field, not a Rust enum: a provider without constrained
+    /// decoding that emits `"full"` must still deserialise.
+    #[test]
+    fn a_non_canonical_edit_mode_still_deserialises() {
+        let parsed: AutoImproveProposal =
+            serde_json::from_value(serde_json::json!({ "edit_mode": "full" }))
+                .expect("must not fail to parse; normalisation happens in validation");
+        assert_eq!(parsed.edit_mode, "full");
+    }
+
+    /// End to end through the normaliser the pipeline actually calls.
+    #[test]
+    fn normalize_proposal_fixes_the_mode_models_emit() {
+        let mut proposal: AutoImproveProposal = serde_json::from_value(serde_json::json!({
+            "edit_mode": "full",
+            "title": "A title",
+            "body_markdown": "Some body.",
+        }))
+        .expect("parses");
+        let mut warnings = Vec::new();
+        normalize_proposal(&mut proposal, &mut warnings);
+        assert_eq!(proposal.edit_mode, CANONICAL_EDIT_MODE);
     }
 }
