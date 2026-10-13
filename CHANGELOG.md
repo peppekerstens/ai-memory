@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `[retrieval] global_scope_limit` (`AI_MEMORY_RETRIEVAL__GLOBAL_SCOPE_LIMIT`)
+  bounds the `global_scope_hits` list of a single-project `memory_query`.
+  Since 2.4.2 a query that names its `workspace` and `project` also returns
+  up to `limit` hits from the `_global` scope, which can double the answer.
+  Unset keeps that behaviour. A number caps the list, and `0` turns the union
+  off and skips its searches.
+
 ### Fixed
 - `[auto_improve] on_session_end` now does what its documentation promised.
   `config.rs` declared the field, gave it a default and tested it, and no other

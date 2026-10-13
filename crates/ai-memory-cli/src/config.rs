@@ -1663,6 +1663,11 @@ pub struct RetrievalSettings {
     /// recency hit, in characters. These hits have no matched term to
     /// centre an excerpt on. Accepts 80 to 2000.
     pub descriptor_chars: usize,
+    /// Upper bound on the `global_scope_hits` list of a single-project
+    /// `memory_query`. Unset keeps the shipped behaviour: up to `limit` more
+    /// hits from the `_global` scope and the profile scope. `0` turns the
+    /// union off. Env: `AI_MEMORY_RETRIEVAL__GLOBAL_SCOPE_LIMIT`.
+    pub global_scope_limit: Option<usize>,
 }
 
 impl Default for RetrievalSettings {
@@ -1675,6 +1680,7 @@ impl Default for RetrievalSettings {
             belief_authority_weight: base.belief_authority_weight,
             snippet_tokens: base.snippet_tokens,
             descriptor_chars: base.descriptor_chars,
+            global_scope_limit: base.global_scope_limit,
         }
     }
 }
@@ -1693,6 +1699,7 @@ impl RetrievalSettings {
             belief_authority_weight: self.belief_authority_weight.max(0.0),
             snippet_tokens: self.snippet_tokens,
             descriptor_chars: self.descriptor_chars,
+            global_scope_limit: self.global_scope_limit,
         }
         .sanitised()
     }

@@ -2946,7 +2946,15 @@ impl AiMemoryServer {
         // deliberately-narrowed multi-scope set (`scopes`) opts out — the
         // caller asked for exactly those scopes. One extra scoped search when
         // the reserved scope exists; zero cost when it doesn't.
-        let single_project_scoped = args.scopes.is_empty();
+        // `[retrieval] global_scope_limit` caps this union. Unset keeps the
+        // shipped behaviour: the union takes up to `limit` more hits, which
+        // can double the answer. `0` skips the union and its searches.
+        let global_scope_limit = self
+            .reader
+            .retrieval_tuning()
+            .global_scope_limit
+            .map_or(limit, |cap| cap.min(limit));
+        let single_project_scoped = args.scopes.is_empty() && global_scope_limit > 0;
         let global_scope_hits = if single_project_scoped {
             match ai_memory_store::lookup_global_scope(&self.reader).await {
                 Ok(Some(scope)) => {
@@ -2974,7 +2982,7 @@ impl AiMemoryServer {
                                 ProjectSearchOptions {
                                     query: &args.query,
                                     query_vec: query_vec.as_deref(),
-                                    limit,
+                                    limit: global_scope_limit,
                                     include_expired,
                                     explain,
                                     include_superseded,
@@ -3043,7 +3051,7 @@ impl AiMemoryServer {
                                 ProjectSearchOptions {
                                     query: &args.query,
                                     query_vec: query_vec.as_deref(),
-                                    limit,
+                                    limit: global_scope_limit,
                                     include_expired,
                                     explain,
                                     include_superseded,
@@ -3067,6 +3075,8 @@ impl AiMemoryServer {
                 }
             }
         }
+        // The profile scope extends the same list, so cut the total again.
+        global_scope_hits.truncate(global_scope_limit);
         let streams_active = explain.then(|| {
             let mut streams = vec!["fts", "entity"];
             if query_vec.is_some() {
@@ -10581,6 +10591,80 @@ mod tests {
 
     // Issue #154: an absent `_global` scope contributes nothing and is
     // never created by a read.
+    // `[retrieval] global_scope_limit` bounds the second list. The union can
+    // double a single-project answer, and an operator who keeps the payload
+    // small needs a way to cap it or to turn it off.
+    #[tokio::test]
+    async fn global_scope_limit_caps_and_disables_the_union() {
+        let (_tmp, store, mut server, _ws, _proj) = setup_server().await;
+        let global = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        for name in ["style", "tools", "habits"] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: global.workspace_id,
+                    project_id: global.project_id,
+                    path: PagePath::new(format!("preferences/{name}.md")).unwrap(),
+                    title: name.into(),
+                    body: format!("Karpathy approved standing preference about {name}."),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                    evidence: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let query = || QueryArgs {
+            query: "karpathy".into(),
+            limit: Some(5),
+            project: Some("scratch".into()),
+            scopes: Vec::new(),
+            workspace: Some("default".into()),
+            global: None,
+            include_expired: None,
+            include_superseded: None,
+            pin_first: None,
+            explain: None,
+            as_of: None,
+            answer: None,
+            reasoning: None,
+        };
+        let mut global_hits = Vec::new();
+        for cap in [None, Some(1), Some(0)] {
+            server
+                .reader
+                .set_retrieval_tuning(ai_memory_store::RetrievalTuning {
+                    global_scope_limit: cap,
+                    ..ai_memory_store::RetrievalTuning::default()
+                });
+            let result = server
+                .memory_query(Parameters(query()), OptionalParts(test_parts_default()))
+                .await
+                .unwrap();
+            let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+            assert_eq!(
+                value["hits"].as_array().map(Vec::len),
+                Some(1),
+                "the project hits must not change with the cap {cap:?}: {}",
+                text.text
+            );
+            global_hits.push(value["global_scope_hits"].as_array().map_or(0, Vec::len));
+        }
+        assert_eq!(
+            global_hits,
+            vec![3, 1, 0],
+            "unset keeps every global hit, 1 keeps one, 0 turns the union off"
+        );
+    }
+
     #[tokio::test]
     async fn default_query_without_global_scope_is_unchanged() {
         let (_tmp, store, server, _ws, _proj) = setup_server().await;

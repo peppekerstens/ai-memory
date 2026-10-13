@@ -71,6 +71,13 @@ pub struct RetrievalTuning {
     /// graph-neighbour or recency hit. Clamped to
     /// [`DESCRIPTOR_CHARS_MIN`]..=[`DESCRIPTOR_CHARS_MAX`].
     pub descriptor_chars: usize,
+    /// Upper bound on the `global_scope_hits` list that a single-project
+    /// `memory_query` adds from the reserved `_global` scope and the profile
+    /// scope. `None` (the default) keeps the shipped behaviour: the list
+    /// takes up to the query `limit`. `Some(0)` skips the union and its
+    /// searches. The list is a second answer next to `hits`, so this bounds
+    /// the payload the same way the two widths above do.
+    pub global_scope_limit: Option<usize>,
 }
 
 /// Lowest FTS5 snippet token budget.
@@ -105,6 +112,7 @@ impl Default for RetrievalTuning {
             belief_authority_weight: 0.0,
             snippet_tokens: SNIPPET_TOKENS_DEFAULT,
             descriptor_chars: DESCRIPTOR_CHARS_DEFAULT,
+            global_scope_limit: None,
         }
     }
 }
@@ -232,6 +240,7 @@ mod tests {
         assert_eq!(t.belief_authority_weight, 0.0);
         assert_eq!(t.snippet_tokens, SNIPPET_TOKENS_DEFAULT);
         assert_eq!(t.descriptor_chars, DESCRIPTOR_CHARS_DEFAULT);
+        assert_eq!(t.global_scope_limit, None);
     }
 
     #[test]
