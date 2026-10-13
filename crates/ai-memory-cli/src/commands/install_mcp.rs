@@ -11,9 +11,11 @@
 //! community-standard `npx mcp-remote` stdio shim so the same HTTP
 //! endpoint still works.
 //!
-//! OMP uses a native `~/.omp/agent/mcp.json` file with the same
-//! `mcpServers` root as several other clients.
+//! OMP uses a native `mcp.json` in its agent dir (`~/.omp/agent`, a named
+//! profile's `~/.omp/profiles/<name>/agent`, or `$PI_CODING_AGENT_DIR`) with
+//! the same `mcpServers` root as several other clients.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -55,10 +57,54 @@ enum JsonMcpLocation {
 /// Returns an error if JSON serialisation fails (should never happen
 /// for our handcrafted values).
 pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
-    let server_url = effective_mcp_server_url(config, &args);
+    run_with_opencode_dialect(config, args, None)
+}
+
+pub(crate) fn run_with_opencode_dialect(
+    config: &Config,
+    mut args: InstallMcpArgs,
+    dialect: Option<ai_memory_workstream::OpenCodeDialect>,
+) -> Result<()> {
+    let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+    args.client = match (args.client, dialect) {
+        (McpClient::OpenCode, Some(ai_memory_workstream::OpenCodeDialect::V1)) => {
+            McpClient::OpenCode
+        }
+        (McpClient::OpenCode, Some(ai_memory_workstream::OpenCodeDialect::V2)) => {
+            McpClient::OpenCode2
+        }
+        (client, None) => super::opencode_dialect::resolve_client(client, &child_env)?,
+        (client, Some(_)) => client,
+    };
+    let needs_inferred_url = args.server_url.is_none() && !config.server_url_configured();
+    let needs_inferred_token = args.auth_token.is_none() && config.auth.bearer_token.is_none();
+    let inferred = if args.name == "ai-memory"
+        && matches!(args.client, McpClient::OpenCode | McpClient::OpenCode2)
+        && (needs_inferred_url || needs_inferred_token)
+    {
+        let path = resolve_config_file(&args)?;
+        fs::read_to_string(path)
+            .ok()
+            .map(|content| infer_owned_opencode_mcp_config(&content, args.client))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let server_url = if config.server_url_configured() || args.server_url.is_some() {
+        effective_mcp_server_url(config, &args)
+    } else {
+        inferred.as_ref().map_or_else(
+            || DEFAULT_MCP_URL.to_string(),
+            |entry| entry.mcp_url.clone(),
+        )
+    };
     let args = InstallMcpArgs {
         server_url: Some(server_url),
-        auth_token: args.auth_token.or_else(|| config.auth.bearer_token.clone()),
+        auth_token: args
+            .auth_token
+            .or_else(|| config.auth.bearer_token.clone())
+            .or_else(|| inferred.and_then(|entry| entry.auth_token)),
         ..args
     };
     validate_args(&args)?;
@@ -84,6 +130,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::KiroCli => render_kiro_cli(&args)?,
         McpClient::CommandCode => render_command_code(&args)?,
+        McpClient::CopilotCli => render_copilot_cli(&args)?,
         McpClient::Swival => render_swival(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
@@ -160,23 +207,35 @@ fn validate_kiro_remote_url(server_url: &str) -> Result<()> {
 /// Returns an error for `Pi` (no MCP config), for Claude Desktop on
 /// unsupported OSes, or when `$HOME` can't be resolved.
 pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> {
+    mcp_config_path_with(client, &|name| std::env::var_os(name))
+}
+
+/// [`mcp_config_path`] with the relocation variables (`CLAUDE_CONFIG_DIR`,
+/// `CODEX_HOME`, `COPILOT_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`, and OMP's
+/// `OMP_PROFILE`, `PI_PROFILE`, `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR`) read
+/// through `env`,
+/// so `ai-memory run --env` can point auto-wire at the same config home
+/// it launches the harness with.
+pub(crate) fn mcp_config_path_with(
+    client: crate::cli::McpClient,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
     use crate::cli::McpClient;
     let home = || home_dir().context("could not locate $HOME for config-file auto-detect");
     Ok(match client {
-        McpClient::ClaudeCode => claude_code_config_path_in(std::env::var_os("CLAUDE_CONFIG_DIR"))?,
-        McpClient::Codex => home()?.join(".codex").join("config.toml"),
+        McpClient::ClaudeCode => claude_code_config_path_in(env("CLAUDE_CONFIG_DIR"))?,
+        McpClient::Codex => codex_config_path_in(env("CODEX_HOME"))?,
         // Project scope is `.grok/config.toml` under cwd/repo; pass
         // --config-file for that case rather than inventing a second default.
-        McpClient::Grok => grok_home()?.join("config.toml"),
+        McpClient::Grok => grok_home_in(env("GROK_HOME"))?.join("config.toml"),
         McpClient::OpenCode => home()?
             .join(".config")
             .join("opencode")
             .join("opencode.json"),
-        // V2 reads the same global config file (`opencode.json(c)`); its
-        // `mcp.servers` key coexists with v1's `mcp` key in one strict-JSON
-        // file, so both binaries stay wired side by side. Users who keep
-        // comments in `opencode.jsonc` should pass it via `--config-file`
-        // (`mutate_json` refuses to rewrite non-strict JSON).
+        // V2 reads the same global config file (`opencode.json(c)`) but uses
+        // `mcp.servers`. Users who keep comments in `opencode.jsonc` should
+        // pass it via `--config-file` (`mutate_json` refuses to rewrite
+        // non-strict JSON).
         McpClient::OpenCode2 => home()?
             .join(".config")
             .join("opencode")
@@ -193,18 +252,29 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             }
             #[cfg(target_os = "windows")]
             {
-                let local_data_dir = dirs::data_local_dir()
+                // The variables come first, through `env`, so a relocated
+                // profile (`run --env`, a hermetic test) is honoured; the
+                // Known Folder API ignores them.
+                let known_dir = |name: &str, fallback: fn() -> Option<PathBuf>| {
+                    env(name)
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .or_else(fallback)
+                };
+                let local_data_dir = known_dir("LOCALAPPDATA", dirs::data_local_dir)
                     .context("could not locate %LOCALAPPDATA% for Claude Desktop config")?;
-                let roaming_config_dir = dirs::config_dir()
+                let roaming_config_dir = known_dir("APPDATA", dirs::config_dir)
                     .context("could not locate %APPDATA% for Claude Desktop config")?;
                 claude_desktop_config_path_in(&local_data_dir, &roaming_config_dir)?
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                bail!(
-                    "Claude Desktop is not officially distributed for this OS. \
-                     Pass --config-file explicitly if you know where it lives."
-                );
+                // Anthropic's Linux beta keeps Electron's profile, and the
+                // config, under $XDG_CONFIG_HOME/Claude.
+                claude_desktop_config_path_linux(
+                    &dirs::config_dir()
+                        .context("could not locate the user config directory for Claude Desktop")?,
+                )
             }
         }
         McpClient::GeminiCli => home()?.join(".gemini").join("settings.json"),
@@ -212,7 +282,11 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         McpClient::Pi => bail!(
             "Pi has no native mcp.json; use `ai-memory install-hooks --agent pi --apply` to install the generated MCP bridge extension."
         ),
-        McpClient::Omp => home()?.join(".omp").join("agent").join("mcp.json"),
+        // OMP reads mcp.json from its agent dir, the one its extensions live
+        // in, so a profile, PI_CODING_AGENT_DIR or PI_CONFIG_DIR moves it too.
+        McpClient::Omp => {
+            ai_memory_workstream::omp_agent_dir(&home()?, None, env)?.join("mcp.json")
+        }
         McpClient::AntigravityCli => home()?
             .join(".gemini")
             .join("config")
@@ -229,11 +303,16 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // Kimi Code keeps its data dir at $KIMI_CODE_HOME when set,
         // falling back to ~/.kimi-code; MCP servers live in mcp.json at
         // that root.
-        McpClient::KimiCode => kimi_code_home(std::env::var_os("KIMI_CODE_HOME"))?.join("mcp.json"),
-        McpClient::KiroCli => kiro_home(std::env::var_os("KIRO_HOME"))?
+        McpClient::KimiCode => kimi_code_home(env("KIMI_CODE_HOME"))?.join("mcp.json"),
+        McpClient::KiroCli => kiro_home(env("KIRO_HOME"))?
             .join("settings")
             .join("mcp.json"),
         McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
+        // Copilot CLI keeps its whole config dir at $COPILOT_HOME when set,
+        // falling back to ~/.copilot; user-level MCP servers live in
+        // mcp-config.json there (project `.mcp.json` / `.github/mcp.json`
+        // files are left to `--config-file`).
+        McpClient::CopilotCli => copilot_home_in(env("COPILOT_HOME"))?.join("mcp-config.json"),
         McpClient::Swival => {
             let cwd = std::env::current_dir()
                 .context("could not resolve current dir for .swival/mcp.json default")?;
@@ -284,6 +363,12 @@ fn swival_project_root(start: &Path) -> PathBuf {
 fn zed_config_path_in(config_dir: &Path, target_os: &str) -> PathBuf {
     let app_dir = if target_os == "windows" { "Zed" } else { "zed" };
     config_dir.join(app_dir).join("settings.json")
+}
+
+/// Claude Desktop's config file under the Linux user config directory.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn claude_desktop_config_path_linux(config_dir: &Path) -> PathBuf {
+    config_dir.join("Claude").join("claude_desktop_config.json")
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -386,34 +471,72 @@ fn claude_code_config_path_in(env_override: Option<std::ffi::OsString>) -> Resul
         .join(".claude.json"))
 }
 
-/// Kimi Code's data dir: `$KIMI_CODE_HOME` when set (non-empty), else
+/// Codex's user config, where its MCP servers live: `$CODEX_HOME/config.toml`
+/// when the var is set, else `~/.codex/config.toml`. Codex keeps its whole
+/// config home under `CODEX_HOME`, which `install-hooks` already honors for
+/// `hooks.json`; writing the MCP entry to the default path left a relocated
+/// Codex with hooks but no ai-memory server. Blank counts as unset, as it does
+/// for the hooks path. The env value comes in as a parameter so tests can
+/// exercise both branches without mutating process env.
+fn codex_config_path_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("config.toml"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.codex/config.toml")?
+        .join(".codex")
+        .join("config.toml"))
+}
+
+/// Kimi Code's data dir: `$KIMI_CODE_HOME` when set and not blank, else
 /// `~/.kimi-code`. The env value comes in as a parameter so tests can
 /// exercise both branches without mutating process env.
 fn kimi_code_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
-    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(dir));
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
     }
     Ok(home_dir()
         .context("could not locate $HOME for config-file auto-detect")?
         .join(".kimi-code"))
 }
 
-/// Kiro CLI's global configuration root: `$KIRO_HOME` when set, otherwise
-/// `~/.kiro`. The override is injected to keep path tests process-local.
+/// Kiro CLI's global configuration root: `$KIRO_HOME` when set and not
+/// blank, otherwise `~/.kiro`. The override is injected to keep path tests
+/// process-local.
 fn kiro_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
-    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(dir));
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
     }
     Ok(home_dir()
         .context("could not locate $HOME for Kiro configuration")?
         .join(".kiro"))
 }
 
+/// GitHub Copilot CLI's configuration directory: `$COPILOT_HOME` when set and
+/// not blank, otherwise `~/.copilot`. It holds both `mcp-config.json` and the
+/// user-level `hooks/` directory, so `install-hooks --agent copilot-cli`
+/// resolves through here too. The override is injected to keep tests
+/// process-local.
+pub(crate) fn copilot_home_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for Copilot CLI configuration")?
+        .join(".copilot"))
+}
+
 /// Resolve Grok Build CLI's user configuration root. Grok honours
 /// `GROK_HOME`; otherwise it uses `~/.grok`.
 pub(crate) fn grok_home() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("GROK_HOME").filter(|path| !path.is_empty()) {
-        return Ok(PathBuf::from(path));
+    grok_home_in(std::env::var_os("GROK_HOME"))
+}
+
+/// [`grok_home`] with the `GROK_HOME` value passed in, so auto-wire can resolve
+/// it from `ai-memory run --env` and tests stay process-local.
+pub(crate) fn grok_home_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
     }
     Ok(home_dir()
         .context("could not locate $HOME for Grok configuration")?
@@ -428,6 +551,47 @@ fn resolve_config_file(args: &InstallMcpArgs) -> Result<PathBuf> {
         return Ok(p.clone());
     }
     mcp_config_path(args.client)
+}
+
+/// True when the client's MCP config already holds a session-aware ai-memory
+/// bridge under `name` — a Claude Code stdio entry whose args run `mcp-bridge`.
+///
+/// Auto-wire consults this before its version-keyed re-wire so it never
+/// downgrades a deliberately-installed bridge to the static HTTP registration,
+/// which would silently disable `[auto_scope] per_session` for MCP calls. Only
+/// Claude Code has a session-aware variant, so every other client answers
+/// `false`. A missing file or any parse error also answers `false`: the caller
+/// then falls back to its normal install, which is the safe default.
+pub(crate) fn existing_entry_is_session_aware(
+    client: McpClient,
+    config_file: Option<&Path>,
+    name: &str,
+) -> bool {
+    if !matches!(client, McpClient::ClaudeCode) {
+        return false;
+    }
+    let path = match config_file {
+        Some(path) => path.to_path_buf(),
+        None => match mcp_config_path(client) {
+            Ok(path) => path,
+            Err(_) => return false,
+        },
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(entry) = root.get("mcpServers").and_then(|servers| servers.get(name)) else {
+        return false;
+    };
+    let is_stdio = entry.get("type").and_then(serde_json::Value::as_str) == Some("stdio");
+    let runs_bridge = entry
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|args| args.iter().any(|arg| arg.as_str() == Some("mcp-bridge")));
+    is_stdio && runs_bridge
 }
 
 /// Mutate the resolved client config file in place. Idempotent —
@@ -512,6 +676,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::KimiCode
         | McpClient::KiroCli
         | McpClient::CommandCode
+        | McpClient::CopilotCli
         | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
@@ -545,11 +710,239 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     }
 }
 
+fn migrate_opencode_mcp_entry(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    args: &InstallMcpArgs,
+) -> Result<()> {
+    if matches!(args.client, McpClient::OpenCode | McpClient::OpenCode2)
+        && opencode_selected_entry(root, args.client, &args.name)
+            .is_some_and(|entry| !opencode_mcp_entry_has_generated_shape(entry, args.client))
+    {
+        bail!(
+            "refusing to replace user-owned OpenCode MCP entry '{}' in the selected major-version location",
+            args.name
+        );
+    }
+    let alternate = match args.client {
+        McpClient::OpenCode => root
+            .get("mcp")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|mcp| mcp.get("servers"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|servers| servers.get(&args.name))
+            .cloned(),
+        McpClient::OpenCode2 => root
+            .get("mcp")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|mcp| mcp.get(&args.name))
+            .cloned(),
+        _ => None,
+    };
+    let Some(alternate) = alternate else {
+        return Ok(());
+    };
+    if opencode_mcp_entry_has_generated_shape(
+        &alternate,
+        match args.client {
+            McpClient::OpenCode => McpClient::OpenCode2,
+            McpClient::OpenCode2 => McpClient::OpenCode,
+            other => other,
+        },
+    ) && opencode_selected_entry(root, args.client, &args.name)
+        .is_some_and(|entry| !opencode_mcp_entry_has_generated_shape(entry, args.client))
+    {
+        bail!(
+            "refusing to replace a user-owned OpenCode MCP entry '{}' in the selected major-version location while migrating the generated alternate entry",
+            args.name
+        );
+    }
+    if !opencode_mcp_entry_is_owned(&alternate, args) {
+        eprintln!(
+            "[ai-memory] warning: preserving ambiguous OpenCode MCP entry '{}' in the alternate major-version location",
+            args.name
+        );
+        return Ok(());
+    }
+    let mcp = root
+        .get_mut("mcp")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("`mcp` is present but not an object")?;
+    match args.client {
+        McpClient::OpenCode => {
+            if let Some(servers) = mcp
+                .get_mut("servers")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                servers.remove(&args.name);
+                if servers.is_empty() {
+                    mcp.remove("servers");
+                }
+            }
+        }
+        McpClient::OpenCode2 => {
+            mcp.remove(&args.name);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InferredOpenCodeMcpConfig {
+    pub(crate) mcp_url: String,
+    pub(crate) auth_token: Option<String>,
+}
+
+pub(crate) fn infer_owned_opencode_mcp_config(
+    content: &str,
+    selected: McpClient,
+) -> Result<Option<InferredOpenCodeMcpConfig>> {
+    let root: serde_json::Value = match serde_json::from_str(content) {
+        Ok(root) => root,
+        Err(_) => return Ok(None),
+    };
+    let v1_entry = root.pointer("/mcp/ai-memory");
+    let v2_entry = root.pointer("/mcp/servers/ai-memory");
+    let v1 = v1_entry.and_then(|entry| inferred_owned_opencode_entry(entry, McpClient::OpenCode));
+    let v2 = v2_entry.and_then(|entry| inferred_owned_opencode_entry(entry, McpClient::OpenCode2));
+    let selected_is_user_owned = match selected {
+        McpClient::OpenCode => v1_entry.is_some() && v1.is_none(),
+        McpClient::OpenCode2 => v2_entry.is_some() && v2.is_none(),
+        _ => false,
+    };
+    let alternate_is_generated = match selected {
+        McpClient::OpenCode => v2.is_some(),
+        McpClient::OpenCode2 => v1.is_some(),
+        _ => false,
+    };
+    if selected_is_user_owned && alternate_is_generated {
+        bail!(
+            "a user-owned OpenCode MCP entry occupies the selected major-version location while a generated entry remains in the alternate location; preserved both, pass explicit --server-url and --auth-token after resolving the conflict"
+        );
+    }
+    match (v1, v2) {
+        (Some(v1), Some(v2)) if v1 != v2 => bail!(
+            "conflicting generated OpenCode MCP entries exist in the V1 and V2 locations; pass explicit --server-url and --auth-token before installing"
+        ),
+        (Some(v1), Some(_)) | (Some(v1), None) => Ok(Some(v1)),
+        (None, Some(v2)) => Ok(Some(v2)),
+        (None, None) => {
+            let selected_entry = match selected {
+                McpClient::OpenCode => root.pointer("/mcp/ai-memory"),
+                McpClient::OpenCode2 => root.pointer("/mcp/servers/ai-memory"),
+                _ => None,
+            };
+            if selected_entry.is_some() {
+                eprintln!(
+                    "[ai-memory] warning: preserving user-owned OpenCode MCP entry in the selected major-version location; pass explicit --server-url and --auth-token rather than inferring from it"
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn inferred_owned_opencode_entry(
+    entry: &serde_json::Value,
+    location: McpClient,
+) -> Option<InferredOpenCodeMcpConfig> {
+    if !opencode_mcp_entry_has_generated_shape(entry, location) {
+        return None;
+    }
+    let object = entry.as_object()?;
+    Some(InferredOpenCodeMcpConfig {
+        mcp_url: object
+            .get("url")
+            .and_then(serde_json::Value::as_str)?
+            .to_string(),
+        auth_token: object
+            .get("headers")
+            .and_then(|headers| headers.get("Authorization"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.trim().strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn opencode_selected_entry<'a>(
+    root: &'a serde_json::Map<String, serde_json::Value>,
+    client: McpClient,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    let mcp = root.get("mcp")?.as_object()?;
+    match client {
+        McpClient::OpenCode => mcp.get(name),
+        McpClient::OpenCode2 => mcp.get("servers")?.as_object()?.get(name),
+        _ => None,
+    }
+}
+
+fn opencode_generated_headers(headers: Option<&serde_json::Value>) -> bool {
+    let Some(headers) = headers else {
+        return true;
+    };
+    let Some(headers) = headers.as_object() else {
+        return false;
+    };
+    headers.len() == 1
+        && headers
+            .get("Authorization")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.starts_with("Bearer ") && value.len() > "Bearer ".len())
+}
+
+fn opencode_mcp_entry_has_generated_shape(entry: &serde_json::Value, location: McpClient) -> bool {
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    if entry.get("type").and_then(serde_json::Value::as_str) != Some("remote")
+        || entry
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return false;
+    }
+    let allowed = ["type", "url", "enabled", "oauth", "headers"];
+    if entry.keys().any(|key| !allowed.contains(&key.as_str()))
+        || !opencode_generated_headers(entry.get("headers"))
+    {
+        return false;
+    }
+    match location {
+        McpClient::OpenCode => {
+            entry.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
+                && !entry.contains_key("oauth")
+        }
+        McpClient::OpenCode2 => {
+            entry.get("oauth").and_then(serde_json::Value::as_bool) == Some(false)
+                && !entry.contains_key("enabled")
+        }
+        _ => false,
+    }
+}
+
+fn opencode_mcp_entry_is_owned(entry: &serde_json::Value, args: &InstallMcpArgs) -> bool {
+    let expected_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    entry.get("url").and_then(serde_json::Value::as_str) == Some(expected_url)
+        && opencode_mcp_entry_has_generated_shape(
+            entry,
+            match args.client {
+                McpClient::OpenCode => McpClient::OpenCode2,
+                McpClient::OpenCode2 => McpClient::OpenCode,
+                other => other,
+            },
+        )
+}
+
 fn upsert_json_mcp_entry(
     root: &mut serde_json::Map<String, serde_json::Value>,
     args: &InstallMcpArgs,
 ) -> Result<()> {
     let entry = build_json_mcp_entry(args)?;
+    migrate_opencode_mcp_entry(root, args)?;
     match json_mcp_location(args.client).context("internal: unsupported JSON MCP client")? {
         JsonMcpLocation::RootMcpServers => {
             let servers = root
@@ -827,6 +1220,19 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
+        }
+        McpClient::CopilotCli => {
+            // Copilot CLI's `mcp-config.json` remote entry: `type: "http"` +
+            // `url`, optional `headers`, and `tools`, written as `["*"]` (all
+            // tools — Copilot's documented default and its own example).
+            // Verified against
+            // https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers.
+            entry.insert("type".into(), json!("http"));
+            entry.insert("url".into(), json!(server_url));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+            entry.insert("tools".into(), json!(["*"]));
         }
         _ => bail!("internal: build_mcp_entry called for unsupported client"),
     }
@@ -1113,7 +1519,7 @@ fn render_codex(args: &InstallMcpArgs) -> String {
     // and NOT a `[mcp_servers.<name>.headers]` sub-table (the key
     // is `http_headers`, with the `http_` prefix).
     let mut out = format!(
-        "# Codex CLI — append to ~/.codex/config.toml\n\
+        "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
          #\n\
          [mcp_servers.{name}]\n\
          url = \"{url}\"\n\
@@ -1184,10 +1590,10 @@ fn render_opencode2(args: &InstallMcpArgs) -> Result<String> {
         "# OpenCode 2.0 beta (`opencode2`) — merge into\n\
          # ~/.config/opencode/opencode.json(c) under \"mcp\" → \"servers\":\n\
          #\n\
-         # V2 nests servers under `mcp.servers` (v1 used top-level `mcp`)\n\
-         # and has no `enabled` field. Both keys coexist in the one file,\n\
-         # so v1 and the beta stay wired side by side. If your config is\n\
-         # `opencode.jsonc` with comments, re-run with\n\
+         # V2 nests servers under `mcp.servers` (V1 used direct `mcp`)\n\
+         # and has no `enabled` field. Apply mode migrates an alternate V1\n\
+         # entry only when its endpoint and generated shape prove ownership.\n\
+         # If your config is `opencode.jsonc` with comments, re-run with\n\
          # `--config-file ~/.config/opencode/opencode.jsonc`.\n\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
@@ -1221,8 +1627,8 @@ fn render_claude_desktop(args: &InstallMcpArgs) -> Result<String> {
          #   - Windows (MSIX):       %LOCALAPPDATA%\\Packages\\Claude_<id>\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json\n\
          #     --apply detects the installed form; if multiple MSIX packages\n\
          #     are present, select the active one with --config-file.\n\
-         #   - Linux:    Claude Desktop is not officially distributed for Linux;\n\
-         #               use Claude Code or another HTTP client instead.\n\
+         #   - Linux (beta, Debian/Ubuntu): $XDG_CONFIG_HOME/Claude/claude_desktop_config.json\n\
+         #               (default ~/.config/Claude/claude_desktop_config.json)\n\
          #\n\
          # Claude Desktop's JSON config does not support HTTP MCP servers\n\
          # directly. We bridge through the community `mcp-remote` stdio shim\n\
@@ -1335,7 +1741,10 @@ fn hook_server_url_from_mcp_url(url: &str) -> String {
 
 fn render_omp(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
-        "# Oh My Pi / OMP — merge into ~/.omp/agent/mcp.json:\n\
+        "# Oh My Pi / OMP — merge into mcp.json in OMP's agent dir:\n\
+         # ~/.omp/agent/mcp.json by default, ~/.omp/profiles/<name>/agent/mcp.json\n\
+         # under a named profile (OMP_PROFILE), or $PI_CODING_AGENT_DIR/mcp.json\n\
+         # when that variable relocates the default profile.\n\
          #\n\
          # The current Oh My Pi package exposes the `omp` binary and native\n\
          # `.omp` config directories. Restart `omp` after changing MCP config.\n\
@@ -1403,6 +1812,23 @@ fn render_command_code(args: &InstallMcpArgs) -> Result<String> {
          # The equivalent CLI registration is:\n\
          #   cmd mcp add --transport http --scope user {name} {url}\n\
          # (`cmdc` is the native Windows executable name.)\n\
+         {snippet}\n",
+        name = args.name,
+        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_copilot_cli(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# GitHub Copilot CLI — merge into $COPILOT_HOME/mcp-config.json\n\
+         # (default ~/.copilot/mcp-config.json), or re-run with --apply to merge\n\
+         # it in place preserving other servers. Project-level `.mcp.json` and\n\
+         # `.github/mcp.json` also work: pass that path via --config-file.\n\
+         #\n\
+         # The equivalent CLI registration is:\n\
+         #   copilot mcp add --transport http {name} {url}\n\
+         # Pair with `ai-memory install-hooks --agent copilot-cli` for capture.\n\
          {snippet}\n",
         name = args.name,
         url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
@@ -1556,6 +1982,302 @@ mod tests {
     }
 
     #[test]
+    fn opencode_mcp_migration_moves_only_owned_alternate_shape() {
+        let args = args_with_token(McpClient::OpenCode2);
+        let mut root = json!({
+            "mcp": {
+                "ai-memory": {
+                    "type": "remote",
+                    "url": "http://127.0.0.1:49374/mcp",
+                    "enabled": true,
+                    "headers": {"Authorization": "Bearer old"}
+                },
+                "other": {"type": "remote", "url": "https://example.invalid/mcp"}
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        assert!(root["mcp"].get("ai-memory").is_none());
+        assert_eq!(root["mcp"]["other"]["url"], "https://example.invalid/mcp");
+        assert_eq!(root["mcp"]["servers"]["ai-memory"]["oauth"], json!(false));
+        let once = serde_json::to_string_pretty(&root).unwrap();
+        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        assert_eq!(serde_json::to_string_pretty(&root).unwrap(), once);
+    }
+
+    #[test]
+    fn opencode_mcp_migration_works_in_both_major_directions() {
+        let mut root = json!({
+            "mcp": {
+                "servers": {
+                    "ai-memory": {
+                        "type": "remote",
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "oauth": false
+                    }
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        upsert_json_mcp_entry(&mut root, &args_for(McpClient::OpenCode)).unwrap();
+        assert!(root["mcp"].get("servers").is_none());
+        assert_eq!(root["mcp"]["ai-memory"]["enabled"], json!(true));
+    }
+
+    #[test]
+    fn opencode_mcp_migration_preserves_custom_headers() {
+        let args = args_for(McpClient::OpenCode2);
+        let user_entry = json!({
+            "type": "remote",
+            "url": "http://127.0.0.1:49374/mcp",
+            "enabled": true,
+            "headers": {
+                "Authorization": "Bearer user-token",
+                "X-User-Route": "custom"
+            }
+        });
+        let mut root = json!({"mcp": {"ai-memory": user_entry.clone()}})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        assert_eq!(root["mcp"]["ai-memory"], user_entry);
+        assert!(root["mcp"]["servers"]["ai-memory"].is_object());
+    }
+
+    #[test]
+    fn opencode_mcp_migration_accepts_only_historical_generated_headers() {
+        for headers in [
+            None,
+            Some(json!({"Authorization": "Bearer historical-token"})),
+        ] {
+            let mut entry = serde_json::Map::from_iter([
+                ("type".to_string(), json!("remote")),
+                ("url".to_string(), json!("http://127.0.0.1:49374/mcp")),
+                ("enabled".to_string(), json!(true)),
+            ]);
+            if let Some(headers) = headers {
+                entry.insert("headers".to_string(), headers);
+            }
+            assert!(opencode_mcp_entry_is_owned(
+                &serde_json::Value::Object(entry),
+                &args_for(McpClient::OpenCode2),
+            ));
+        }
+    }
+
+    #[test]
+    fn opencode_install_reuses_owned_endpoint_and_token_across_major_transitions() {
+        for (client, initial, selected_path, removed_path, expected_url) in [
+            (
+                McpClient::OpenCode2,
+                json!({"mcp":{"ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer v1-token"}}}}),
+                "/mcp/servers/ai-memory",
+                "/mcp/ai-memory",
+                "http://v1-host:49374/mcp",
+            ),
+            (
+                McpClient::OpenCode,
+                json!({"mcp":{"servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false,"headers":{"Authorization":"Bearer v2-token"}}}}}),
+                "/mcp/ai-memory",
+                "/mcp/servers/ai-memory",
+                "http://v2-host:49374/mcp",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config_path = tmp.path().join("opencode.json");
+            fs::write(
+                &config_path,
+                serde_json::to_string_pretty(&initial).unwrap(),
+            )
+            .unwrap();
+            let config = Config::default();
+            let mut args = args_for(client);
+            args.server_url = None;
+            args.config_file = Some(config_path.clone());
+            args.apply = true;
+
+            run_with_opencode_dialect(
+                &config,
+                args,
+                Some(match client {
+                    McpClient::OpenCode => ai_memory_workstream::OpenCodeDialect::V1,
+                    McpClient::OpenCode2 => ai_memory_workstream::OpenCodeDialect::V2,
+                    _ => unreachable!(),
+                }),
+            )
+            .unwrap();
+
+            let root: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+            let entry = root.pointer(selected_path).unwrap();
+            assert_eq!(entry["url"], expected_url);
+            let expected_token = if client == McpClient::OpenCode2 {
+                "Bearer v1-token"
+            } else {
+                "Bearer v2-token"
+            };
+            assert_eq!(entry["headers"]["Authorization"], expected_token);
+            assert!(root.pointer(removed_path).is_none());
+        }
+    }
+
+    #[test]
+    fn opencode_install_refuses_conflicting_owned_transition_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("opencode.json");
+        let initial = json!({"mcp":{
+            "ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true},
+            "servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false}}
+        }});
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&initial).unwrap(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::OpenCode2);
+        args.server_url = None;
+        args.config_file = Some(config_path.clone());
+        args.apply = true;
+
+        let error = run_with_opencode_dialect(
+            &Config::default(),
+            args,
+            Some(ai_memory_workstream::OpenCodeDialect::V2),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting generated OpenCode MCP entries")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(config_path).unwrap())
+                .unwrap(),
+            initial
+        );
+    }
+
+    #[test]
+    fn opencode_install_refuses_generated_transition_over_a_user_owned_selected_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("opencode.json");
+        let initial = json!({"mcp":{
+            "ai-memory":{"type":"remote","url":"http://user-host:49374/mcp","enabled":true,"command":"user-owned"},
+            "servers":{"ai-memory":{"type":"remote","url":"http://generated-host:49374/mcp","oauth":false}}
+        }});
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&initial).unwrap(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::OpenCode);
+        args.server_url = None;
+        args.config_file = Some(config_path.clone());
+        args.apply = true;
+
+        let error = run_with_opencode_dialect(
+            &Config::default(),
+            args,
+            Some(ai_memory_workstream::OpenCodeDialect::V1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("user-owned OpenCode MCP entry"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(config_path).unwrap())
+                .unwrap(),
+            initial
+        );
+    }
+
+    #[test]
+    fn opencode_install_does_not_infer_from_a_user_owned_transition_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("opencode.json");
+        let user = json!({
+            "type":"remote",
+            "url":"http://user-host:49374/mcp",
+            "enabled":true,
+            "headers":{"Authorization":"Bearer user-token","X-User":"route"}
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({"mcp":{"ai-memory":user.clone()}})).unwrap(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::OpenCode2);
+        args.server_url = None;
+        args.config_file = Some(config_path.clone());
+        args.apply = true;
+
+        run_with_opencode_dialect(
+            &Config::default(),
+            args,
+            Some(ai_memory_workstream::OpenCodeDialect::V2),
+        )
+        .unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(root["mcp"]["ai-memory"], user);
+        assert_eq!(root["mcp"]["servers"]["ai-memory"]["url"], DEFAULT_MCP_URL);
+    }
+
+    #[test]
+    fn opencode_mcp_apply_is_byte_idempotent_after_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("opencode.json");
+        fs::write(
+            &config,
+            serde_json::to_string_pretty(&json!({
+                "mcp": {
+                    "ai-memory": {
+                        "type": "remote",
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "enabled": true
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::OpenCode2);
+        args.config_file = Some(config.clone());
+        args.apply = true;
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read(&config).unwrap();
+        apply_to_config_file(&args).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), first);
+    }
+
+    #[test]
+    fn opencode_mcp_migration_preserves_ambiguous_user_entry() {
+        let args = args_for(McpClient::OpenCode2);
+        let user_entry = json!({
+            "type": "remote",
+            "url": "http://127.0.0.1:49374/mcp",
+            "enabled": true,
+            "command": "user-owned"
+        });
+        let mut root = json!({"mcp": {"ai-memory": user_entry.clone()}})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        assert_eq!(root["mcp"]["ai-memory"], user_entry);
+        assert!(root["mcp"]["servers"]["ai-memory"].is_object());
+    }
+
+    #[test]
     fn opencode2_entry_uses_v2_servers_shape() {
         // V2 nests under `mcp.servers`, drops v1's `enabled`, and disables
         // OAuth discovery: ai-memory authenticates with a static header.
@@ -1620,6 +2342,167 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn codex_config_path_honours_codex_home() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\codex"
+        } else {
+            "/custom/codex"
+        };
+        let path = codex_config_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(path, std::path::Path::new(custom).join("config.toml"));
+
+        // Unset, empty and blank all fall back to ~/.codex/config.toml, the
+        // same reading `install-hooks` gives CODEX_HOME for hooks.json.
+        for env in [
+            None,
+            Some(std::ffi::OsString::new()),
+            Some(std::ffi::OsString::from("  ")),
+        ] {
+            let path = codex_config_path_in(env).unwrap();
+            assert!(
+                path.ends_with(std::path::Path::new(".codex").join("config.toml")),
+                "default must be ~/.codex/config.toml, got {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Auto-wire resolves MCP targets through `run --env`; every relocatable
+    /// client must read its variable from the supplied lookup, not the process.
+    #[test]
+    fn mcp_config_path_with_reads_relocation_from_the_supplied_env() {
+        let root = if cfg!(windows) {
+            std::path::Path::new(r"C:\relocated")
+        } else {
+            std::path::Path::new("/relocated")
+        };
+        for (client, var, relative) in [
+            (McpClient::ClaudeCode, "CLAUDE_CONFIG_DIR", ".claude.json"),
+            (McpClient::Codex, "CODEX_HOME", "config.toml"),
+            (McpClient::CopilotCli, "COPILOT_HOME", "mcp-config.json"),
+            (McpClient::Grok, "GROK_HOME", "config.toml"),
+            (McpClient::KimiCode, "KIMI_CODE_HOME", "mcp.json"),
+            (McpClient::KiroCli, "KIRO_HOME", "settings/mcp.json"),
+            (McpClient::Omp, "PI_CODING_AGENT_DIR", "mcp.json"),
+        ] {
+            let env = |name: &str| (name == var).then(|| root.as_os_str().to_owned());
+            assert_eq!(
+                mcp_config_path_with(client, &env).unwrap(),
+                root.join(relative),
+                "{client:?} must follow {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_desktop_config_sits_under_the_linux_config_dir() {
+        let config = Path::new("/home/me/.config");
+        assert_eq!(
+            claude_desktop_config_path_linux(config),
+            Path::new("/home/me/.config/Claude/claude_desktop_config.json")
+        );
+        let rendered = render_claude_desktop(&args_for(McpClient::ClaudeDesktop)).unwrap();
+        assert!(rendered.contains("$XDG_CONFIG_HOME/Claude/claude_desktop_config.json"));
+        assert!(!rendered.contains("not officially distributed"));
+    }
+
+    /// A relocated Windows profile (`run --env`, a hermetic backup test)
+    /// moves Claude Desktop's config with it; the Known Folder API alone
+    /// would keep pointing at the real profile.
+    #[cfg(windows)]
+    #[test]
+    fn claude_desktop_config_follows_the_supplied_appdata() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("Local");
+        let roaming = root.path().join("Roaming");
+        let env = |name: &str| match name {
+            "LOCALAPPDATA" => Some(local.clone().into_os_string()),
+            "APPDATA" => Some(roaming.clone().into_os_string()),
+            _ => None,
+        };
+        assert_eq!(
+            mcp_config_path_with(McpClient::ClaudeDesktop, &env).unwrap(),
+            roaming.join("Claude").join("claude_desktop_config.json")
+        );
+    }
+
+    /// OMP's MCP file lives in the same agent dir as its extensions: a named
+    /// profile owns it and ignores `PI_CODING_AGENT_DIR`, as OMP does.
+    #[test]
+    fn omp_mcp_config_follows_the_profile_agent_dir() {
+        let home = home_dir().unwrap();
+        let profile = home
+            .join(".omp")
+            .join("profiles")
+            .join("work")
+            .join("agent")
+            .join("mcp.json");
+        for pairs in [
+            &[("OMP_PROFILE", "work")][..],
+            &[("OMP_PROFILE", "work"), ("PI_CODING_AGENT_DIR", "/custom")][..],
+            &[("PI_PROFILE", "work")][..],
+        ] {
+            let env = |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            };
+            assert_eq!(
+                mcp_config_path_with(McpClient::Omp, &env).unwrap(),
+                profile,
+                "{pairs:?}"
+            );
+        }
+        let invalid = |name: &str| (name == "OMP_PROFILE").then(|| "Work".into());
+        assert!(mcp_config_path_with(McpClient::Omp, &invalid).is_err());
+        let renamed = |name: &str| (name == "PI_CONFIG_DIR").then(|| ".omp-alt".into());
+        assert_eq!(
+            mcp_config_path_with(McpClient::Omp, &renamed).unwrap(),
+            home.join(".omp-alt").join("agent").join("mcp.json"),
+            "PI_CONFIG_DIR renames OMP's root"
+        );
+    }
+
+    /// A blank relocation variable is unset, the rule every installer and
+    /// native session import share; otherwise the MCP entry, bearer token
+    /// included, landed in a whitespace-named directory under the cwd.
+    #[test]
+    fn mcp_config_path_with_treats_blank_relocation_as_unset() {
+        let home = home_dir().unwrap();
+        for (client, var, relative) in [
+            (McpClient::ClaudeCode, "CLAUDE_CONFIG_DIR", ".claude.json"),
+            (McpClient::Codex, "CODEX_HOME", ".codex/config.toml"),
+            (McpClient::Grok, "GROK_HOME", ".grok/config.toml"),
+            (McpClient::KimiCode, "KIMI_CODE_HOME", ".kimi-code/mcp.json"),
+            (McpClient::KiroCli, "KIRO_HOME", ".kiro/settings/mcp.json"),
+            (McpClient::Omp, "PI_CODING_AGENT_DIR", ".omp/agent/mcp.json"),
+            (McpClient::Omp, "OMP_PROFILE", ".omp/agent/mcp.json"),
+            (McpClient::Omp, "PI_CONFIG_DIR", ".omp/agent/mcp.json"),
+        ] {
+            for blank in ["", "   ", "\t", " \n"] {
+                let env = |name: &str| (name == var).then(|| std::ffi::OsString::from(blank));
+                assert_eq!(
+                    mcp_config_path_with(client, &env).unwrap(),
+                    home.join(relative),
+                    "{client:?} with {var}={blank:?}"
+                );
+            }
+        }
+    }
+
+    /// The snippet names CODEX_HOME rather than a resolved path: it is often
+    /// rendered inside the Docker image, whose paths mean nothing on the host.
+    #[test]
+    fn codex_render_names_codex_home() {
+        let out = render_codex(&args_for(McpClient::Codex));
+        assert!(
+            out.contains("$CODEX_HOME/config.toml"),
+            "render must point a relocated Codex at its config home:\n{out}"
+        );
     }
 
     #[test]
@@ -1698,6 +2581,45 @@ mod tests {
         assert!(rendered.contains("~/.commandcode/mcp.json"));
         assert!(rendered.contains("cmd mcp add --transport http --scope user"));
         assert!(rendered.contains("`cmdc` is the native Windows executable"));
+    }
+
+    /// Copilot CLI's documented remote entry (#1040): root `mcpServers`,
+    /// `type: "http"` + `url` + `headers`, and `tools: ["*"]`.
+    #[test]
+    fn copilot_cli_renderer_uses_documented_http_schema() {
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::CopilotCli)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "mcpServers": {
+                    "ai-memory": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "headers": {
+                            "Authorization": "Bearer test-token-deadbeef"
+                        },
+                        "tools": ["*"]
+                    }
+                }
+            })
+        );
+        let rendered = render_copilot_cli(&args_for(McpClient::CopilotCli)).unwrap();
+        assert!(rendered.contains("mcp-config.json"));
+        assert!(rendered.contains("copilot mcp add --transport http ai-memory"));
+        assert!(rendered.contains("install-hooks --agent copilot-cli"));
+    }
+
+    #[test]
+    fn copilot_home_honours_env_override() {
+        assert_eq!(
+            copilot_home_in(Some("/tmp/custom-copilot-home".into())).unwrap(),
+            PathBuf::from("/tmp/custom-copilot-home")
+        );
+        let default = home_dir().unwrap().join(".copilot");
+        assert_eq!(copilot_home_in(Some("".into())).unwrap(), default);
+        assert_eq!(copilot_home_in(None).unwrap(), default);
     }
 
     #[test]
@@ -1953,6 +2875,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
@@ -1982,6 +2905,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::KiroCli,
             McpClient::CommandCode,
+            McpClient::CopilotCli,
             McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
@@ -2024,6 +2948,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::KiroCli,
             McpClient::CommandCode,
+            McpClient::CopilotCli,
             McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
@@ -2060,6 +2985,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
             McpClient::CommandCode => render_command_code(&args).unwrap(),
+            McpClient::CopilotCli => render_copilot_cli(&args).unwrap(),
             McpClient::Swival => render_swival(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
@@ -2188,7 +3114,14 @@ mod tests {
         let grok_token = render_with_token(McpClient::Grok);
         assert!(grok_token.contains("[mcp_servers.ai-memory.headers]"));
         assert!(!grok_token.contains("http_headers"));
-        assert!(render_for_test(McpClient::Omp).contains("~/.omp/agent/mcp.json"));
+        let omp = render_for_test(McpClient::Omp);
+        for location in [
+            "~/.omp/agent/mcp.json",
+            "~/.omp/profiles/<name>/agent/mcp.json",
+            "$PI_CODING_AGENT_DIR/mcp.json",
+        ] {
+            assert!(omp.contains(location), "{location} missing from:\n{omp}");
+        }
         let pi = render_pi(&args_for(McpClient::Pi)).unwrap();
         assert!(pi.contains("Pi has no native mcp.json"));
         assert!(pi.contains("install-hooks --agent pi --apply"));
@@ -2529,6 +3462,41 @@ mod tests {
         args.server_url = Some("http://192.168.0.90:49374/mcp".into());
         let error = validate_args(&args).unwrap_err();
         assert!(error.to_string().contains("requires HTTPS"), "{error:#}");
+    }
+
+    #[test]
+    fn copilot_cli_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("mcp-config.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"github":{"type":"http","url":"https://api.githubcopilot.com/mcp/"}}}"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::CopilotCli);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(
+            value["mcpServers"]["github"]["url"],
+            "https://api.githubcopilot.com/mcp/"
+        );
+        let ours = &value["mcpServers"]["ai-memory"];
+        assert_eq!(ours["type"], "http");
+        // No default flavor: Copilot CLI fronts several model vendors.
+        assert_eq!(ours["url"], "https://memory.example/mcp");
+        assert_eq!(
+            ours["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert_eq!(ours["tools"], json!(["*"]));
     }
 
     #[test]

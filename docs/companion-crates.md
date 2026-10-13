@@ -23,6 +23,11 @@ the core workspace.
 
 ## Integration rules for companions
 
+Orchestrators that own their harness lifecycle can use the
+[external capture contract](external-lifecycle.md) to suppress native observation
+capture per execution while retaining handoff delivery and MCP retrieval.
+Producer provenance and retry identity use the existing hook ingestion fields.
+
 Companion projects may:
 
 - call the read-only `/api/v1` endpoints for workspaces, projects, pages,
@@ -49,14 +54,61 @@ Companion projects should not:
   resolution, or the single-writer store boundary;
 - require ai-memory to host arbitrary plugin code in-process.
 
-Companion features should be treated as separate products, not rejected ideas.
-They can move faster than core, have their own UX, and carry source-specific or
+Companion features are separate products. They can move faster than core, have their own UX, and carry source-specific or
 workflow-specific behavior without widening ai-memory's default install.
 
 If a companion exposes browser writes, it must implement its own server-side
 mutation broker. Browsers should talk to the companion; the companion should talk
 to ai-memory with an operator token. That keeps CSRF, confirmation, audit, rate
 limits, and UI-specific policy outside the core server.
+
+Read-only companions can start ai-memory with `serve --enable-api` to mount
+`/api/v1` without the browser UI. `--enable-web` still implies the same API.
+Both modes use the normal machine Bearer or browser-session auth boundary;
+writes continue through MCP or authenticated admin routes.
+
+### Proposed team-wiki sync (#986)
+
+A repository-backed team-wiki sync is accepted as a companion shape, not as a
+repo-local storage mode in the core server. A contribution should preserve the
+prototype's three-way comparison and clone-local state, sync only explicitly
+allowed shared page families, default destructive changes to dry-run, report
+divergent edits without choosing a winner, and perform every import through
+the public MCP write/delete tools. It must never open the wiki directory or
+SQLite directly. The core read seam is `/api/v1` in API-only mode; the supported
+MCP page arguments are documented in [programmatic memory](programmatic-memory.md).
+
+Slice 1 (read-only export) shipped as
+[`ai-memory-wikisync`](#ai-memory-wikisync-read-only-team-wiki-export)
+below; the remaining slices are tracked in #986.
+
+## `ai-memory-client`: shared private capture privacy
+
+[`ai-memory-client`](../companions/ai-memory-client) supplies four privacy
+functions consumed by both the relay and external-conversation importer. New
+bodies are scrubbed before serialization, hashes and local persistence; native
+identities containing credentials are refused without being renamed. A relay
+item queued before these checks that fails them is never sent: it is dropped
+locally with a `dropped_policy` receipt, so its session keeps flowing. The package has its own workspace and focused tests, with no
+server dependency. Server authorization and capture exclusions remain the
+authoritative boundaries.
+
+## `ai-memory-relay`: external lifecycle delivery
+
+[`ai-memory-relay`](../companions/ai-memory-relay) delivers events collected by
+an external orchestrator through `/hook/batch`. Its own local queue records events
+before sending and retains unacknowledged entries for a later flush. It does not
+launch agents, claim handoffs, or open ai-memory's database or wiki.
+
+The orchestrator still maps its events to the native harness payloads and sets
+`AI_MEMORY_CAPTURE_OWNER` when launching that harness. The relay uses the native
+session identity and derives retry keys from the producer's stable event IDs.
+Only the first pending event for each session enters a batch; that session
+advances after acknowledgement, even when other sessions are rate-limited.
+
+The package has its own workspace, tests and CLI. Its README defines queue limits,
+local data handling and recovery, with an executable test against the real
+ai-memory server. Root workspace tests do not run the companion's unit tests.
 
 ## `ai-memory-importer`: migration and ingestion companion
 
@@ -150,9 +202,12 @@ Re-home by kind:
 - Never open ai-memory's SQLite database or wiki directory directly.
 - Require an explicit destination workspace/project.
 - Preserve only metadata supported by the public write surface (`title`, `kind`,
-  `tier`, `tags`, `pinned`, and body) unless a future generic core seam adds
-  broader frontmatter support. Do not claim arbitrary frontmatter or author
-  preservation in companion imports.
+  `tier`, `tags`, `pinned`, body, and the bounded `entities`, `abstract`, and
+  `relations` documented in [usage](usage.md#writing-page-metadata)). The current
+  importer preserves the original title/kind/tier/tags/pin subset; broader
+  metadata needs an explicit importer consumer. Do not claim arbitrary
+  frontmatter or author preservation in companion imports. Writes replace the
+  whole page; omitted metadata is cleared.
 - Carry idempotency keys or source fingerprints in companion-side state so failed
   imports can be resumed safely.
 - Validate and sanitize a complete external-conversation envelope before the
@@ -177,6 +232,127 @@ Re-home by kind:
 5. Add re-home/link-rewrite as a separate subcommand after import is stable.
 6. Only after repeated usage, consider whether ai-memory core lacks a small,
    generic API seam; do not start by patching core endpoints.
+
+## `ai-memory-wikisync`: read-only team-wiki export
+
+Slice 1 of the accepted [team-wiki sync](#proposed-team-wiki-sync-986)
+shape, implemented at [`companions/ai-memory-wikisync`](../companions/ai-memory-wikisync)
+as a standalone Cargo package with its own `[workspace]` (mirroring the
+importer): it is not a member of the root workspace and is not covered by
+root `cargo test --workspace`.
+
+### Goal
+
+Mirror a team's shared ai-memory pages into a project repository as
+reviewable markdown, so the wiki a team actually maintains can travel with
+the code it documents. The export is read-only, family-scoped, and dry-run by
+default.
+
+### How it talks to ai-memory
+
+- `plan` (always dry-run) and `export` (dry-run unless `--apply`) against
+  the documented read-only `/api/v1` surface: incremental `recent` listing
+  with cursor paging (legacy array accepted) plus single-page reads with
+  `ETag` / `If-None-Match` revalidation. No MCP, no admin routes, no
+  writes to the server.
+- `--include FAMILY` is an explicit, repeatable allowlist of top-level
+  wiki directories; at least one is required and a bare `*` is refused.
+- Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` only;
+  tokens are never logged or persisted.
+- Writes exactly the server's canonical projection (path, title, body)
+  with no forged attribution/generated frontmatter. All local bookkeeping
+  lives in one state file under the destination
+  (`.ai-memory-wikisync/state.json`, 0600, atomically replaced after each
+  successful write batch). The directory ignores itself with a `.gitignore`
+  of `*`, so the state stays per clone and never reaches a commit.
+
+### Safety requirements honored
+
+- Three-way classification per page (destination file, last exported
+  state, server body): files edited locally since the last export are
+  reported with a diff summary and the whole batch is refused without
+  `--force`.
+- Never deletes anything (deletes are slice 4); never runs git, commits,
+  or pushes. It prints the commands the operator may run.
+- Destination-path safety: traversal, dotfiles, reserved Windows names,
+  non-portable characters, case-fold collisions, oversized bodies,
+  symlinked destinations/components/state directories, and unknown page
+  frontmatter are all refused; files are replaced atomically
+  (tmp + rename + fsync).
+- Page bodies are untrusted data, transported verbatim and never executed
+  or rendered.
+
+### Validation
+
+```bash
+cargo fmt --check --manifest-path companions/ai-memory-wikisync/Cargo.toml
+cargo test --manifest-path companions/ai-memory-wikisync/Cargo.toml
+cargo clippy --manifest-path companions/ai-memory-wikisync/Cargo.toml --all-targets -- -D warnings
+```
+
+Unit tests cover the path-safety matrix, the allowlist rules, state
+hash/crash behavior and local-edit refusal; integration tests run the
+full plan/export flow against a fixture axum server serving `/api/v1`
+responses (200/ETag/304/401/404 and cursor pagination).
+
+### Roadmap (#986)
+
+1. This slice: read-only export into a project repository.
+2. Conditional mutation seam (compare-and-write) in core, if independently
+   justified.
+3. Bidirectional apply through public write tools.
+4. Deletes and conflict reporting.
+5. Post-merge hook / CI integration.
+
+## `ai-memory-macos`: menu bar wrapper
+
+Self-contained macOS accessory app at
+[`companions/ai-memory-macos`](../companions/ai-memory-macos). It is a
+**wrapper** rather than a data-seam dashboard: it ships the `ai-memory` binary and
+`hooks/` tree inside an `.app`, governs the existing LaunchAgent, and opens
+`/web`, `ai-memory status`, `config.toml`, the data directory, and logs.
+
+It is not a root workspace member. Build and test it separately:
+
+```bash
+./companions/ai-memory-macos/build.sh
+swift test --package-path companions/ai-memory-macos
+```
+
+### Goal
+
+Give macOS a first-class install that does not require a prior tarball, without
+reimplementing status, search, wiki browsing, or config editing in SwiftUI.
+
+### How it talks to ai-memory
+
+- `GET /admin/status` for the menu-bar traffic light and two headline lines
+  (version, page/session counts, LLM role).
+- Bundled `ai-memory status` / `ai-memory init` via `Process` (the real CLI).
+- `launchctl` against `com.github.akitaonrails.ai-memory` and the checked-in
+  plist template in `packaging/launchd/`.
+- `NSWorkspace` to open `/web`, `config.toml`, the data dir, and logs.
+
+It does not open SQLite or the wiki, does not call writable `/admin` routes, and
+does not add MCP tools.
+
+### Data vs bundle
+
+Durable state stays in `~/Library/Application Support/ai-memory` (the binary’s
+existing macOS default) and logs under `~/Library/Logs/ai-memory`. Replacing
+`/Applications/AI Memory.app` does not rewrite that tree. An optional data-dir
+override is written only into the rendered LaunchAgent plist
+(`AI_MEMORY_DATA_DIR`), never into the bundle.
+
+### Safety requirements
+
+- Do not silently start the LaunchAgent on first launch; **Install & Start**
+  is an explicit click.
+- Do not write `AI_MEMORY_AUTH_TOKEN` into the plist. The menu bar’s own HTTP
+  client may keep a bearer in the Keychain.
+- Do not sandbox the app in a way that blocks `launchctl` or LaunchAgents.
+
+See [`docs/macos.md`](macos.md#scenario-d-menu-bar-app).
 
 ## `ai-memory-web-editor`: browser chat/editor companion
 
@@ -277,6 +453,61 @@ This plan is intentionally parked until the benefit is clearer.
 6. Keep the built-in `/web` UI unchanged unless core ai-memory independently
    needs a small read-only API enhancement.
 
+### Appendix: browser constraints and prerequisites (not approved)
+
+These notes record constraints for a possible future design review. They do not
+approve the editor, an implementation sequence, or any new core interface. The
+undecided status, parked plan, concern about distracting from the automatic loop,
+and preference for a separate repository above remain unchanged.
+
+#### Browser constraints
+
+- Keep core `/web` and `/api/v1` read-only. Browser requests would go through the
+  companion's own backend, with its own login, session expiry/revocation, CSRF
+  protection, rate limits, confirmation state, and audit. Core human-auth cookies
+  do not establish a companion session.
+- Bind each authenticated browser operator to that operator's own DB-user API
+  token, held only on the backend. Refuse missing, mismatched, or revoked
+  credentials; never fall back to a shared credential. The browser receives no
+  upstream bearer. Secure provisioning and storage still need design review.
+- Exclude the shared static root token, `/admin/*` flows, and actor-proxy
+  credentials from this browser design. A DB-user token does not grant admin
+  access, including when the DB user has `role=root`. Do not forward
+  browser-supplied Authorization, actor, or skip-admission headers. These are
+  editor-specific constraints on the broader operator-token wording above.
+- Reads as well as any future writes must retain the operator's identity and
+  current project permissions. Use explicit workspace/project pairs, reauthorize
+  each request, and isolate drafts, caches, and confirmations by operator, server,
+  and target. UI filters cannot authorize a page; shared pages must not become
+  author-only reads. Preserve explicit access refusals rather than showing empty
+  results.
+- Safely render untrusted Markdown, links, and diffs. Any future mutation needs
+  confirmation bound to the operator, exact target, base revision, and proposed
+  change. No LLM response may apply a write automatically.
+
+#### Prerequisites requiring separate evaluation
+
+- A capability contract or shared client would need independent justification
+  from shipped callers, as discussed in PR #1058. This appendix neither requires
+  a particular SDK nor approves speculative endpoints or wire fields. A reported
+  capability would not replace authorization.
+- Conditional editing needs a safe core compare-and-write seam covering body
+  and editable metadata, coordinated with the normal Wiki and writer paths.
+  Re-reading a page and then writing unconditionally is insufficient. Without
+  that seam, applying edits must remain unavailable; stale revisions require a
+  fresh diff and confirmation. Conditional deletion needs its own evaluation.
+- Any retained-version or evidence reads need current access checks and bounded
+  retention semantics; they must not recover expired or purged content from Git.
+  No new history, graph, or procedure interface is approved here.
+- Mutations must retain sanitization, admission, attribution, and disk/SQL
+  recovery. Direct admission follows the configured failure policy; it is not
+  the automatic loop's separate pending-write approval flow. Uncertain delivery
+  must be reconciled before retrying or reporting success.
+- A future implementation would need adversarial browser and integration tests
+  for XSS, CSRF, identity/scope isolation, revoked access, stale revisions,
+  admission failures, and interrupted writes, with legitimate controls. These
+  are prerequisites, not tests or behavior supplied by this documentation.
+
 ## Two kinds of companion: data-seam vs. independent hook consumer
 
 `ai-memory-importer` and `ai-memory-web-editor` are *data-seam* companions: they
@@ -285,17 +516,16 @@ Not every adjacent tool is that shape.
 
 **Working-tree coordination is out of core, and is an *independent hook
 consumer*, not a data-seam companion** (decided in #620). Several agent sessions
-sharing one checkout collide over the single git index — one session's
-`git add .` sweeps up another's staged work, a `--fix` run rewrites an unclaimed
-tree — and the natural instinct is to build the guard on ai-memory's captured
-`PreToolUse`/`PostToolUse` signal. That does not work, for two deliberate
-reasons:
+sharing one checkout collide over the single git index: one session's
+`git add .` sweeps up another's staged work, or a `--fix` run rewrites an
+unclaimed tree. Building the guard on ai-memory's captured
+`PreToolUse`/`PostToolUse` signal does not work, for two deliberate reasons:
 
 - **ai-memory cannot block a tool action.** The `/hook` path is capture-only and
   fire-and-forget (it returns `202`/`429`, never allow/deny/ask, and processes
   after responding). Hooks that await a REST round-trip can deadlock the engine
-  (agentmemory #221) — so there is no synchronous veto channel back to the
-  harness, by design.
+  (agentmemory #221), so by design there is no synchronous veto channel back to
+  the harness.
 - **ai-memory does not retain the file paths.** For closed-tool agents the
   stored observation is reduced to a `tool_family` label plus outcome; raw
   arguments, paths, and tool names are extracted only transiently for
@@ -303,13 +533,13 @@ reasons:
   arguments, paths, or arbitrary tool names"). A consumer can see *that* a file
   op happened in a session, never *which file*.
 
-Reversing either — persisting paths, or adding a blocking hook — trades away a
-privacy/bounding invariant or the anti-deadlock invariant. Both stay.
+Reversing either (persisting paths, or adding a blocking hook) would trade away a
+privacy/bounding invariant or the anti-deadlock invariant, so both stay.
 
 So a working-tree coordinator installs its **own** `PreToolUse` hook alongside
 ai-memory's, reads the raw `tool_input`, and arbitrates synchronously in its own
-process with its own ephemeral ownership state (a lock file or small store —
-never the wiki or SQLite). It is a *sibling on the same hook event*, not a
+process with its own ephemeral ownership state (a lock file or small store,
+never the wiki or SQLite). It is a *sibling on the same hook event* rather than a
 seam-consumer. It may still live under `companions/` for discoverability, but it
 depends on the harness's hook mechanism, not on ai-memory's surfaces. Scope it
 to the shared-index / file-ownership class; stale-tree builds and host
@@ -335,4 +565,4 @@ Poor core candidates:
 - project-specific scoring, pruning, or normalization policies;
 - companion-only admin commands.
 
-This keeps ai-memory stable while still allowing richer tools to grow around it.
+That keeps ai-memory stable while richer tools grow around it.

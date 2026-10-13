@@ -20,24 +20,39 @@ pub(crate) struct SearchParams {
     pub q: String,
 }
 
+/// Most results the search page renders. One more is requested so a cut-off
+/// result set can be told apart from one that happens to have exactly this many.
+const MAX_RESULTS: usize = 50;
+
 /// Handler for `GET /search?q=…`.
+///
+/// Searches only the repositories the viewer may read (#708) — see
+/// `ReaderPool::search_pages_with_meta`. No viewer (no database users, or
+/// root) searches everything, as before.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Query(params): Query<SearchParams>,
 ) -> Result<Html<String>, StatusCode> {
     let query = params.q.trim().to_owned();
 
-    let hits = if query.is_empty() {
-        Vec::new()
+    let (hits, truncated) = if query.is_empty() {
+        (Vec::new(), false)
     } else {
         let raw = state
             .reader
-            .search_pages_with_meta(query.clone(), 50, None)
+            .search_pages_with_meta(
+                query.clone(),
+                MAX_RESULTS + 1,
+                None,
+                viewer.map(|axum::Extension(viewer)| viewer.user()),
+            )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let mut results = Vec::with_capacity(raw.len());
-        for h in raw {
+        let truncated = raw.len() > MAX_RESULTS;
+        let mut results = Vec::with_capacity(raw.len().min(MAX_RESULTS));
+        for h in raw.into_iter().take(MAX_RESULTS) {
             let path = h.path.as_str().to_owned();
             let href = page_href(&h.workspace_name, &h.project_name, &path);
             results.push(SearchHit {
@@ -49,7 +64,7 @@ pub(crate) async fn handler(
                 snippet: markdown::escape_snippet(&h.snippet),
             });
         }
-        results
+        (results, truncated)
     };
 
     let hit_count = hits.len();
@@ -57,6 +72,8 @@ pub(crate) async fn handler(
         query,
         hits,
         hit_count,
+        truncated,
+        max_results: MAX_RESULTS,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

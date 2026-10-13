@@ -4,6 +4,57 @@ use thiserror::Error;
 
 use ai_memory_core::MemoryError;
 
+/// Which of its keys makes a project answer to an ambiguous name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbiguousMatch {
+    /// The project's current name.
+    Name,
+    /// The canonical path-style key derived from its repository identity.
+    CanonicalKey,
+    /// The v2 basename key derived from its repository identity.
+    LegacyKey,
+}
+
+/// One project that answers to an ambiguous name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousProjectHolder {
+    /// The project's current name, or `None` for a restricted project: the
+    /// project list hides those names from callers without a grant, and the
+    /// lookup that fails here runs before any caller is authorized.
+    pub name: Option<String>,
+    /// The key that matched.
+    pub matched_by: AmbiguousMatch,
+}
+
+/// The projects behind a [`StoreError::ProjectNameAmbiguous`], rendered as
+/// the tail of its message so the operator can see which project to rename,
+/// purge or pin with a marker. Empty when the lookup did not collect them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AmbiguousProjectHolders(pub Vec<AmbiguousProjectHolder>);
+
+impl std::fmt::Display for AmbiguousProjectHolders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let last = self.0.len().saturating_sub(1);
+        for (index, holder) in self.0.iter().enumerate() {
+            f.write_str(match index {
+                0 => ": it is ",
+                _ if index == last => " and ",
+                _ => ", ",
+            })?;
+            f.write_str(match holder.matched_by {
+                AmbiguousMatch::Name => "the name of ",
+                AmbiguousMatch::CanonicalKey => "the canonical key of ",
+                AmbiguousMatch::LegacyKey => "the legacy key of ",
+            })?;
+            match &holder.name {
+                Some(name) => write!(f, "project '{name}'")?,
+                None => f.write_str("a restricted project")?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Result alias used throughout the store crate.
 pub type StoreResult<T> = Result<T, StoreError>;
 
@@ -71,6 +122,15 @@ pub enum StoreError {
     #[error("project name '{0}' is already taken in this workspace")]
     ProjectNameTaken(String),
 
+    /// More than one project in a workspace matched a compatibility name.
+    #[error("project name '{name}' is ambiguous in this workspace{holders}")]
+    ProjectNameAmbiguous {
+        /// The name the caller asked for.
+        name: String,
+        /// The projects that answer to it, when the lookup knows them.
+        holders: AmbiguousProjectHolders,
+    },
+
     /// The supplied project name failed validation (empty, slash, etc.).
     #[error("invalid project name: {0}")]
     InvalidProjectName(String),
@@ -118,6 +178,24 @@ pub enum StoreError {
     #[error("workspace name '{0}' is already taken")]
     WorkspaceNameTaken(String),
 
+    /// A page create was refused because another live page in the same scope
+    /// differs from it only by case or Unicode normalization. Such a pair is
+    /// one file on macOS and Windows, so creating the second destroys the
+    /// first (#1/#2: the index kept both rows and served the survivor's body
+    /// for either path).
+    #[error(
+        "page path '{requested}' collides with existing page '{existing}': they differ only in \
+         case or Unicode normalization, so a case-insensitive or normalizing filesystem (macOS, \
+         Windows) stores both at one file and this write would destroy the other page. Choose a \
+         distinct path, or delete/rename the existing page first."
+    )]
+    PagePathCollides {
+        /// The path this write asked for.
+        requested: String,
+        /// The live page it would land on.
+        existing: String,
+    },
+
     /// A session move was rejected because the destination scope already has
     /// a latest page at the session page path (`idx_pages_latest_path`), so
     /// re-stamping the source versions would collide. The caller retries with
@@ -144,6 +222,10 @@ pub enum StoreError {
     /// description.
     #[error("os error: {0}")]
     Os(String),
+
+    /// An authenticated finish authority failed an owner or project guard.
+    #[error("forbidden: {0}")]
+    Forbidden(&'static str),
 
     /// A persisted row contains malformed data.
     #[error("malformed record: {0}")]

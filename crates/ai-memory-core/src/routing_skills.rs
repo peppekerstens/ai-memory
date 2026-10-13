@@ -14,6 +14,8 @@ pub const AGENTS_SKILL_DIR: &str = ".agents";
 pub const DEVIN_SKILL_DIR: &str = ".devin";
 /// Grok Build CLI Agent Skill directory below a project or home root.
 pub const GROK_SKILL_DIR: &str = ".grok";
+/// Hermes Agent Skill directory below a project or home root.
+pub const HERMES_SKILL_DIR: &str = ".hermes";
 /// Leaf directory that contains individual Agent Skill directories.
 pub const SKILLS_DIR: &str = "skills";
 
@@ -244,8 +246,9 @@ mod tests {
                 "Static MCP clients",
                 "must pass `workspace` and `project` together on every project-scoped call",
                 "nearest `.ai-memory.toml`",
-                "never guess them from a directory name",
-                "never rely on the server's last active project",
+                "normalized `upstream`, then `origin`",
+                "folder basename only when no valid remote exists",
+                "Never rely on the server's last active project",
                 "`global=true` must omit `workspace`, `project`, and `scopes`",
                 "`scope: \"global\"`",
             ] {
@@ -274,7 +277,7 @@ mod tests {
         let Some((frontmatter, _body)) = rest.split_once("\n---\n") else {
             panic!("{} must close frontmatter", skill.name);
         };
-        serde_yaml::from_str(frontmatter)
+        serde_saphyr::from_str(frontmatter)
             .unwrap_or_else(|e| panic!("{} frontmatter must be valid YAML: {e}", skill.name))
     }
 

@@ -38,6 +38,9 @@ sha2.workspace = true
 base64.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+# Sets SO_KEEPALIVE on accepted `serve` sockets (#792); not a workspace dep,
+# `ai-memory-cli` is the only crate that needs it.
+socket2 = "0.6.3"
 clap.workspace = true
 clap_complete.workspace = true
 crossterm.workspace = true
@@ -73,6 +76,7 @@ serde_json.workspace = true
 toml_edit.workspace = true
 sysinfo.workspace = true
 tar.workspace = true
+zip.workspace = true
 jiff.workspace = true
 jsonc-parser.workspace = true
 tokio.workspace = true
@@ -90,6 +94,7 @@ tempfile.workspace = true
 ai-memory-test-support.workspace = true
 tempfile.workspace = true
 rstest.workspace = true
+rusqlite.workspace = true
 tower.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

@@ -16,7 +16,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+serde-saphyr = { workspace = true, features = ["deserialize", "serialize"] }
 tempfile.workspace = true
 jiff.workspace = true
 tar.workspace = true

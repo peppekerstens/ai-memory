@@ -3,12 +3,12 @@
 {% block title %}{{ project }} — ai-memory{% endblock %}
 
 {% block content %}
-<nav class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+<nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
   <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
-  <span>/</span>
-  <span class="text-slate-400 dark:text-slate-500">{{ workspace }}</span>
-  <span>/</span>
-  <span class="text-slate-700 dark:text-slate-200 font-medium">{{ project }}</span>
+  <span aria-hidden="true">/</span>
+  <span class="text-slate-500 dark:text-slate-400">{{ workspace }}</span>
+  <span aria-hidden="true">/</span>
+  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">{{ project }}</span>
 </nav>
 
 <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-6">{{ workspace }}/{{ project }}</h1>
@@ -16,9 +16,9 @@
 <div class="flex flex-col md:flex-row gap-8">
   <!-- Sidebar: folder tree -->
   <aside class="w-full md:w-56 shrink-0">
-    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500 mb-3">Pages</h2>
+    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">Pages</h2>
     {% if folders.is_empty() %}
-    <p class="text-sm text-slate-400 dark:text-slate-600">No pages yet.</p>
+    <p class="text-sm text-slate-500 dark:text-slate-400">No pages yet.</p>
     {% else %}
     <ul class="space-y-1">
       {% for folder in folders %}
@@ -40,7 +40,7 @@
     {% endif %}
     {% if !system.is_empty() %}
     <details class="mt-6">
-      <summary class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500 cursor-pointer select-none">System</summary>
+      <summary class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 cursor-pointer select-none">System</summary>
       <ul class="space-y-1 mt-3">
         {% for folder in system %}
         <li>
@@ -64,9 +64,9 @@
 
   <!-- Main: recent pages -->
   <div class="flex-1 min-w-0">
-    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500 mb-3">Recent Activity</h2>
+    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">Recent Activity</h2>
     {% if recent.is_empty() %}
-    <p class="text-sm text-slate-400 dark:text-slate-600">No pages yet.</p>
+    <p class="text-sm text-slate-500 dark:text-slate-400">No pages yet.</p>
     {% else %}
     <ul class="divide-y divide-slate-100 dark:divide-slate-800">
       {% for page in recent %}
@@ -80,10 +80,10 @@
             <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
               {{ page.kind }}
             </span>
-            <span class="text-xs text-slate-400 dark:text-slate-500 truncate">{{ page.path }}</span>
+            <span class="text-xs text-slate-500 dark:text-slate-400 truncate">{{ page.path }}</span>
           </div>
         </div>
-        <span class="text-xs text-slate-400 dark:text-slate-500 whitespace-nowrap shrink-0">{{ page.updated_relative }}</span>
+        <span class="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">{{ page.updated_relative }}</span>
       </li>
       {% endfor %}
     </ul>

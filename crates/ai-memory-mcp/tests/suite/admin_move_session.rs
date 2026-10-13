@@ -7,6 +7,7 @@
 //! consolidation job) and a `sessions/<id>.md` page written through the wiki
 //! so a real file sits on disk.
 
+use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, ProjectId,
     Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
@@ -41,6 +42,8 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
@@ -137,6 +140,7 @@ async fn seed_session(
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: sid,
             workspace_id: ws,
             project_id: proj,
@@ -151,6 +155,7 @@ async fn seed_session(
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id: sid,
                     workspace_id: ws,
                     project_id: proj,
@@ -383,6 +388,57 @@ async fn move_session_restamps_rows_moves_file_and_checkpoints() {
 }
 
 #[tokio::test]
+async fn move_session_create_surfaces_destination_promotion_manifest_warning() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let scopes = seed_scopes(&store).await;
+    let sid = seed_session(&store, &state.wiki, scopes.ws, scopes.src, "/repo/src").await;
+    let (destination, _) = store
+        .writer
+        .resolve_project_by_identity(
+            scopes.other_ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    state.wiki.backfill_scope_manifests().await.unwrap();
+    let manifest = tmp
+        .path()
+        .join("wiki")
+        .join(scopes.other_ws.to_string())
+        .join(destination.to_string())
+        .join("_meta.md");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let resp = post(
+        &state,
+        "/admin/move-session",
+        json!({
+            "session_id": sid.to_string(), "workspace": "other", "project": "acme-api",
+            "create": true, "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(
+        body["manifest_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("committed")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn move_session_across_workspaces_and_regenerate() {
     let tmp = TempDir::new().unwrap();
     let (state, store) = make_state(&tmp).await;
@@ -514,6 +570,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
+                occurred_at: None,
                 session_id: sid,
                 workspace_id: scopes.ws,
                 project_id: scopes.src,
@@ -572,6 +629,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: open,
             workspace_id: scopes.ws,
             project_id: scopes.src,
@@ -688,6 +746,7 @@ async fn move_session_batch_stops_at_first_error_and_reports_progress() {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: open,
             workspace_id: scopes.ws,
             project_id: scopes.src,
@@ -924,6 +983,7 @@ async fn scatter_observations(
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id: sid,
                     workspace_id: ws,
                     project_id: proj,
@@ -1034,6 +1094,7 @@ async fn move_session_rehome_of_open_session_needs_no_force() {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: sid,
             workspace_id: scopes.ws,
             project_id: scopes.dst,

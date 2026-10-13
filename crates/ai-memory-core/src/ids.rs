@@ -80,6 +80,20 @@ macro_rules! id_newtype {
 id_newtype!(pub WorkspaceId, "Workspace identifier (top of the 3-tuple).");
 id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
+
+impl SessionId {
+    /// Resolve a harness-native session id to the `SessionId` the store keys
+    /// on: a UUID native id is used as-is (canonicalized); any other string
+    /// (Codex, OpenCode, ...) is hashed to a deterministic UUID v5, so hook
+    /// POSTs and later lookups by native id share one key. The hook router and
+    /// any offline tool that matches transcripts by native id (e.g.
+    /// `ai-memory repair-backfill-timestamps`) must agree on this one rule.
+    #[must_use]
+    pub fn from_native(raw: &str) -> Self {
+        Self::from_str(raw)
+            .unwrap_or_else(|_| Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
+    }
+}
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
@@ -203,6 +217,23 @@ impl fmt::Display for PagePath {
     }
 }
 
+/// The key a case-folding or Unicode-normalizing filesystem effectively
+/// stores a page path under: two paths with the same key are one file on
+/// macOS (APFS) and Windows (NTFS), whatever they look like here.
+///
+/// Lowercase first, then compose: `İ` lowercases to `i` + U+0307, which only
+/// composes back to a single scalar after the fold.
+#[must_use]
+pub fn portable_page_key(path: &str) -> String {
+    let lowered = path.to_lowercase();
+    let nfc = icu_normalizer::ComposingNormalizer::new_nfc();
+    if nfc.is_normalized(&lowered) {
+        lowered
+    } else {
+        nfc.normalize(&lowered).into_owned()
+    }
+}
+
 /// Discriminator for the agent CLI that captured an observation or handoff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -249,6 +280,11 @@ pub enum AgentKind {
     Pool,
     /// ZCode (z.ai) coding agent.
     Zcode,
+    /// GitHub Copilot CLI (`copilot`), configured with PascalCase hook event
+    /// names for a Claude Code/VS-Code-compatible payload shape (#1040).
+    CopilotCli,
+    /// GrizzyBot, a native macOS agent app that posts its own lifecycle events.
+    Grizzybot,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -259,7 +295,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -280,6 +316,8 @@ impl AgentKind {
         Self::Hermes,
         Self::Pool,
         Self::Zcode,
+        Self::CopilotCli,
+        Self::Grizzybot,
         Self::Other,
     ];
 
@@ -307,6 +345,8 @@ impl AgentKind {
             Self::Hermes => "hermes",
             Self::Pool => "pool",
             Self::Zcode => "zcode",
+            Self::CopilotCli => "copilot-cli",
+            Self::Grizzybot => "grizzybot",
             Self::Other => "other",
         }
     }
@@ -337,6 +377,8 @@ impl AgentKind {
             "hermes" | "hermes-agent" => Self::Hermes,
             "pool" | "poolside" => Self::Pool,
             "zcode" | "zai" => Self::Zcode,
+            "copilot-cli" | "copilot_cli" => Self::CopilotCli,
+            "grizzybot" | "grizzy-bot" => Self::Grizzybot,
             _ => Self::Other,
         }
     }
@@ -345,8 +387,10 @@ impl AgentKind {
     /// into the resuming session as context. Agents that consume it return
     /// `true` (Claude Code reads `hookSpecificOutput.additionalContext`).
     ///
-    /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks docs:
-    /// "For events like SessionStart or PostToolUse, stdout is ignored"), and
+    /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks guide:
+    /// stdout for that event is ignored). `PostToolUse` stdout is read and
+    /// `additionalContext` is shown to the model after the tool result. See
+    /// [`Self::post_tool_injects_handoff`].
     /// Zero's agent loop discards the sessionStart dispatch result entirely
     /// (`internal/agent/loop.go` ignores `Dispatch`'s return there), so
     /// the native hook must NOT fetch the handoff for it: the fetch is
@@ -374,6 +418,11 @@ impl AgentKind {
     /// `<system-reminder>` text block of the first user message sent to the
     /// model (verified live against the embedded engine v0.16.5, capture logs
     /// 2026-08-28), so its native hook fetches the handoff like Claude Code's.
+    ///
+    /// GitHub Copilot CLI injects `SessionStart` context from a top-level
+    /// `additionalContext` key (GitHub's hooks reference), not Claude Code's
+    /// `hookSpecificOutput` envelope, even in its PascalCase payload mode; the
+    /// native hook prints that top-level envelope for it.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
@@ -397,9 +446,48 @@ impl AgentKind {
     /// `session/hooks/user-prompt.ts`, verified in the v0.28.1 source).
     /// Empty stdout injects nothing, so the hook prints the raw handoff body
     /// or nothing at all — never a JSON envelope.
+    ///
+    /// Grok Build also ignores `SessionStart` stdout, and it is not in this
+    /// set. An allowing `UserPromptSubmit` discards stdout and has no
+    /// `additionalContext`. `GET /handoff` marks the handoff accepted, so
+    /// fetching on that event would burn the baton. Grok shows
+    /// `PostToolUse` `additionalContext` to the model; that is
+    /// [`Self::post_tool_injects_handoff`].
     #[must_use]
     pub fn user_prompt_injects_handoff(self) -> bool {
         matches!(self, Self::KimiCode)
+    }
+
+    /// Whether `PostToolUse` stdout is model-visible context.
+    ///
+    /// Grok Build reads that stdout and delivers `hookSpecificOutput.additionalContext`
+    /// after the tool result (`10-hooks.md`, PostToolUse Output). The handoff
+    /// is accepted on the first such event of a session, not on `SessionStart`
+    /// or `UserPromptSubmit`, because those outputs never reach the model.
+    /// The model sees the handoff after the first tool, not before the first
+    /// prompt. A session that never calls a tool leaves the handoff open for
+    /// `memory_handoff_accept`.
+    #[must_use]
+    pub fn post_tool_injects_handoff(self) -> bool {
+        matches!(self, Self::Grok)
+    }
+
+    /// Whether this agent reuses one session id across a `SessionEnd` and a
+    /// later restart of the same conversation.
+    ///
+    /// Grok does: the same session id comes back after an end, so an already-
+    /// ended receiver row is a live restart, not a corpse, and
+    /// `accept_handoff` reopens it. Kimi Code does too: a resumed session
+    /// reuses the native session id after `SessionEnd` (same shape as Grok;
+    /// observed in production 2026-10). For every other agent an ended
+    /// session is
+    /// final — a late/out-of-order startup fetch must not rebind it to a new
+    /// handoff, so accepting into an ended session stays an error (this is what
+    /// keeps a lifecycle-only receiver from reclaiming after it released and
+    /// ended).
+    #[must_use]
+    pub fn reuses_session_id_after_end(self) -> bool {
+        matches!(self, Self::Grok | Self::KimiCode)
     }
 }
 
@@ -428,6 +516,28 @@ mod tests {
         assert!(PagePath::new("a/../b").is_err());
     }
 
+    /// A UUID native id round-trips as-is; a non-UUID native id (Codex,
+    /// OpenCode) hashes to a deterministic UUID v5, so hook capture and any
+    /// offline tool matching transcripts by native id agree on one key.
+    #[test]
+    fn session_id_from_native_hashes_non_uuid_ids_and_passes_uuids_through() {
+        let uuid_native = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(SessionId::from_native(uuid_native).to_string(), uuid_native);
+
+        let non_uuid_native = "codex-native-id-123";
+        let expected = SessionId(Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            non_uuid_native.as_bytes(),
+        ));
+        assert_eq!(SessionId::from_native(non_uuid_native), expected);
+        // Deterministic: repeated calls (and hence repeated hook deliveries,
+        // or a repeated repair run) must resolve to the same id.
+        assert_eq!(
+            SessionId::from_native(non_uuid_native),
+            SessionId::from_native(non_uuid_native)
+        );
+    }
+
     #[test]
     fn agent_kind_grok_round_trips() {
         assert_eq!(AgentKind::Grok.as_str(), "grok");
@@ -440,9 +550,13 @@ mod tests {
         );
         // Unknown tags still degrade to Other.
         assert_eq!(AgentKind::from_wire("grok-2"), AgentKind::Other);
-        // Grok cannot inject the session-start handoff (ignores hook stdout);
-        // every other agent can.
+        // Grok cannot inject the session-start handoff (ignores hook stdout),
+        // and must not fetch on UserPromptSubmit either (that stdout is discarded).
         assert!(!AgentKind::Grok.session_start_injects_handoff());
+        assert!(!AgentKind::Grok.user_prompt_injects_handoff());
+        assert!(AgentKind::Grok.post_tool_injects_handoff());
+        assert!(!AgentKind::KimiCode.post_tool_injects_handoff());
+        assert!(!AgentKind::ClaudeCode.post_tool_injects_handoff());
         assert!(!AgentKind::Zero.session_start_injects_handoff());
         assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
         assert!(AgentKind::Codex.session_start_injects_handoff());
@@ -488,6 +602,12 @@ mod tests {
         // source), so the handoff is delivered on UserPromptSubmit instead.
         assert!(!AgentKind::KimiCode.session_start_injects_handoff());
         assert!(AgentKind::KimiCode.user_prompt_injects_handoff());
+        // A resumed session reuses the native id after SessionEnd (observed
+        // in production 2026-10), the same shape as Grok's restart.
+        assert!(AgentKind::KimiCode.reuses_session_id_after_end());
+        assert!(AgentKind::Grok.reuses_session_id_after_end());
+        assert!(!AgentKind::ClaudeCode.reuses_session_id_after_end());
+        assert!(!AgentKind::Codex.reuses_session_id_after_end());
     }
 
     #[test]
@@ -522,6 +642,47 @@ mod tests {
         // destructive handoff fetch must not happen from its native hook.
         assert!(!AgentKind::Pool.session_start_injects_handoff());
         assert!(!AgentKind::Pool.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_copilot_cli_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::CopilotCli.as_str(), "copilot-cli");
+        assert_eq!(AgentKind::from_wire("copilot-cli"), AgentKind::CopilotCli);
+        assert_eq!(AgentKind::from_wire("copilot_cli"), AgentKind::CopilotCli);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CopilotCli).unwrap(),
+            "\"copilot-cli\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"copilot-cli\"").unwrap(),
+            AgentKind::CopilotCli
+        );
+        // The bare "copilot" word is deliberately NOT an alias here: it is
+        // already claimed by the unrelated `McpClient::VsCodeCopilot` client
+        // (#1040), and aliasing both to different things would be confusing.
+        assert_eq!(AgentKind::from_wire("copilot"), AgentKind::Other);
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("copilot-cli-2"), AgentKind::Other);
+        // Copilot CLI reads a top-level `additionalContext` at SessionStart,
+        // which the native hook prints for it.
+        assert!(AgentKind::CopilotCli.session_start_injects_handoff());
+        assert!(!AgentKind::CopilotCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_grizzybot_round_trips() {
+        assert_eq!(AgentKind::Grizzybot.as_str(), "grizzybot");
+        assert_eq!(AgentKind::from_wire("grizzybot"), AgentKind::Grizzybot);
+        assert_eq!(AgentKind::from_wire("grizzy-bot"), AgentKind::Grizzybot);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Grizzybot).unwrap(),
+            "\"grizzybot\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"grizzybot\"").unwrap(),
+            AgentKind::Grizzybot
+        );
+        assert_eq!(AgentKind::from_wire("grizzybot-2"), AgentKind::Other);
     }
 
     #[test]
@@ -690,6 +851,23 @@ mod tests {
             AgentKind::Devin
         );
     }
+
+    #[test]
+    fn session_id_from_native_keeps_uuids_and_hashes_other_ids() {
+        let uuid = SessionId::new();
+        assert_eq!(SessionId::from_native(&uuid.to_string()), uuid);
+        let hashed = SessionId::from_native("agy-session-1");
+        assert_eq!(
+            hashed,
+            SessionId::from_native("agy-session-1"),
+            "deterministic"
+        );
+        assert_eq!(
+            hashed.0,
+            Uuid::new_v5(&Uuid::NAMESPACE_OID, b"agy-session-1"),
+            "the key hook POSTs have always used"
+        );
+    }
 }
 
 /// Names Windows reserves regardless of extension: `CON.md` is still the
@@ -698,6 +876,13 @@ const DOS_DEVICE_NAMES: &[&str] = &[
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
+
+/// Whether `stem` (a file name without its extension) is a DOS device name
+/// Windows resolves to a device instead of a file, compared case-insensitively.
+#[must_use]
+pub fn is_dos_device_name(stem: &str) -> bool {
+    DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str())
+}
 
 /// Characters Windows refuses in a filename. `/` is the separator and is
 /// handled by the caller; `\\` and a drive prefix are already rejected by
@@ -745,7 +930,7 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
     // Device names match on the stem, so `CON`, `CON.md` and `con.markdown`
     // are all the console.
     let stem = component.split('.').next().unwrap_or(component);
-    if DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str()) {
+    if is_dos_device_name(stem) {
         return invalid(&format!(
             "uses the reserved DOS device name {stem:?}; Windows resolves it to a device, not a file"
         ));
@@ -761,7 +946,7 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
 
 #[cfg(test)]
 mod portable_page_path_tests {
-    use super::PagePath;
+    use super::{PagePath, portable_page_key};
 
     /// Every shape #462 reproduced on native Windows. Each either fails late
     /// with a 500, or writes but cannot be checkpointed by libgit2 and cannot
@@ -889,6 +1074,34 @@ mod portable_page_path_tests {
                 PagePath::new(raw).is_ok(),
                 "{raw:?} must still construct so persisted rows stay readable"
             );
+        }
+    }
+
+    #[test]
+    fn portable_key_collapses_case_and_normalization() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/Alpha.md"),
+            ("Concepts/alpha.md", "concepts/ALPHA.md"),
+            ("concepts/caf\u{00e9}.md", "concepts/cafe\u{0301}.md"),
+            ("concepts/CAF\u{00c9}.md", "concepts/cafe\u{0301}.md"),
+        ] {
+            assert_eq!(
+                portable_page_key(a),
+                portable_page_key(b),
+                "{a:?} and {b:?} are one file on macOS/Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_key_keeps_distinct_paths_distinct() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/alphabet.md"),
+            ("concepts/alpha.md", "decisions/alpha.md"),
+            ("concepts/nested/a.md", "concepts/a.md"),
+            ("concepts/cafe.md", "concepts/caf\u{00e9}.md"),
+        ] {
+            assert_ne!(portable_page_key(a), portable_page_key(b));
         }
     }
 }

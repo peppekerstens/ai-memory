@@ -1,6 +1,9 @@
 # Rust build artefacts.
 /target/
 /companions/*/target/
+/companions/*/.build/
+/companions/*/.swiftpm/
+/companions/*/dist/
 /dist/
 **/*.rs.bk
 **/*.rs.orig
@@ -22,6 +25,9 @@
 *.swo
 .idea/
 .vscode/
+
+# Python bytecode from running the docs/examples stdlib tests.
+__pycache__/
 
 # Local debugging.
 *.log

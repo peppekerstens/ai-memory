@@ -5,7 +5,7 @@
 ai-memory runs without an LLM: hooks still capture sessions, search uses
 FTS5 + declared entities + graph neighbors, and summaries fall back to
 rule-based output. Add an LLM provider
-when you want LLM consolidation (on PreCompact, on demand via
+when you want LLM consolidation (on PreCompact / PostCompaction, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
 Substantive session ends always write a rule-based summary page + handoff either
@@ -13,10 +13,17 @@ way. A session containing only `SessionStart` / `SessionEnd` boundaries is
 closed without a page, handoff, or provider job. When that empty session had
 accepted startup context, its session-bound handoff is returned to the open
 pool for the next receiver instead of being lost.
-When the session-end opt-in is enabled, provider work is durably queued after
-those deterministic writes and handled by one bounded server worker, so hook
-drain latency does not cancel it. Failed jobs retry with backoff and survive a
-server restart. A resumed native session is ended again only after its
+PreCompact / PostCompaction write a rule-based checkpoint on the hook request.
+Provider work for those checkpoints, and for opt-in SessionEnd, is durably
+queued after those deterministic writes and handled by one bounded server
+worker, so hook drain latency does not cancel it. The worker starts whenever a
+consolidator is configured; SessionEnd enqueue stays behind the opt-in flag.
+A checkpoint rewrite still queued when the session ends runs once anyway, even
+with the flag off. One already running when the session ends finishes after the
+SessionEnd summary and replaces it, so with the flag off the latest page can
+leave out the end of the session; the summary stays reachable as the superseded
+version. Every queued job runs as the session owner recorded at session start,
+not anonymously. Failed jobs retry with backoff and survive a server restart. A resumed native session is ended again only after its
 observation generation advances; the persisted generation watermark makes
 duplicate SessionEnd delivery and system clock skew converge without repeated
 provider work. The end watermark and automatic handoff commit atomically, and
@@ -43,13 +50,15 @@ Recommended defaults:
 | Provider | Default | Use when |
 |---|---|---|
 | `anthropic` | `claude-haiku-4-5` | Best default for consolidation quality and rule classification. |
-| `anthropic-oauth` | `claude-sonnet-4-6` | Use a Claude Pro/Max subscription via `claude setup-token`, no API key. |
+| `anthropic-oauth` | `claude-sonnet-4-6` | Use a Claude Pro/Max subscription via `claude setup-token`, no API key. Currently refused by Anthropic for third-party apps (usually `429`); see below. |
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
 | `codex` | `gpt-5.6-luna` | Reuse the Codex CLI-owned `auth.json`; access-token refresh remains owned by `codex app-server`. |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
-| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `opencode` | `mimo-v2.6-flash` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
+| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1` | no default (recommended: `anthropic/claude-haiku-4.5`) | Hosted access to a large model catalogue through one key. See [OpenRouter](#openrouter) below and the empirical comparison in [`llm-provider-comparison.md`](llm-provider-comparison.md). |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
 the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
@@ -80,11 +89,223 @@ Docker is not configured automatically: the Codex executable, `CODEX_HOME`,
 and its credential file must all exist in the same container/environment as
 ai-memory.
 
+`opencode` talks to OpenCode's gateway with the `sk-...` key from
+`opencode.ai/auth`, read from `OPENCODE_API_KEY` only; it does not fall back
+to `LLM_API_KEY`. It defaults to the **Go** endpoint,
+`https://opencode.ai/zen/go/v1`: a subscription with a per-model monthly
+allowance rather than per-token billing. Set
+`AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` (or `llm_base_url` in
+`config.toml`) for **Zen**'s pay-per-token catalogue. Model ids are per
+catalogue and written plainly (`mimo-v2.5`, `glm-5.3-flash`), not in the
+`opencode-go/<model>` form OpenCode's own client config uses. The built-in
+default is `mimo-v2.6-flash`, served by Go. When selecting Zen, set
+`AI_MEMORY_LLM_MODEL` to a model from its catalogue, such as `claude-sonnet-5-5`.
+The provider preserves the chosen catalogue and does not switch billing products
+automatically. Published Responses models, including `gpt-5.6-luna` and
+`gpt-6-luna`, use `/responses`. The wire API follows the selected catalogue:
+`minimax-m3`, `minimax-m2.7`, and `qwen3.8-max` use `/messages` on Go and
+Chat Completions on Zen. Go's `muse-spark-1.3-contributor` and
+`muse-spark-1.2-contributor` use `/responses`. Supported Claude and the other
+mapped Qwen models use `/messages`; remaining models retain Chat Completions.
+Changing the base URL reselects the transport and preserves timeout, reasoning
+effort, and operator headers. Go is identified by a URL path ending in
+`/zen/go` or `/zen/go/v1`, optionally including a complete endpoint;
+custom proxy URLs with other paths use the Zen mapping.
+See the official [Go endpoints](https://opencode.ai/docs/go/#endpoints) and
+[Zen endpoints](https://opencode.ai/docs/zen/#endpoints), whose source tables
+are [go.mdx](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/go.mdx)
+and [zen.mdx](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/zen.mdx).
+The provider sends the
+`x-opencode-session` correlation header OpenCode asks for, one id per logical
+operation, and its own `User-Agent`; `AI_MEMORY_LLM_HEADERS` overrides
+either. `AI_MEMORY_LLM_REASONING_EFFORT` and `AI_MEMORY_LLM_TIMEOUT_SECS`
+apply as for every other provider. `AI_MEMORY_LLM_PROVIDER` / `llm_provider`
+also accept the historical aliases `opencode-zen` and `opencode_zen` for the
+same provider (`llm-test --provider` takes only `opencode`); the endpoint is
+chosen by the base URL, not the alias.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=opencode
+export AI_MEMORY_LLM_MODEL=mimo-v2.6-flash
+ai-memory llm-test --provider opencode --model mimo-v2.6-flash --prompt "Reply with OK"
+```
+
+For Claude through Zen:
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=opencode
+export AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1
+export AI_MEMORY_LLM_MODEL=claude-sonnet-5-5
+ai-memory llm-test --provider opencode --model claude-sonnet-5-5 --prompt "Reply with OK"
+```
+
+<a id="openrouter"></a>
+[OpenRouter](https://openrouter.ai) is used through the generic `openai-compat`
+provider, the same wiring as Atlas Cloud, OrcaRouter, Ollama, vLLM, and LM
+Studio. There is no dedicated `openrouter` provider name, and setting
+`AI_MEMORY_LLM_PROVIDER=openrouter` fails at startup with
+`AI_MEMORY_LLM_PROVIDER=openrouter is not one of anthropic|openai|gemini|openai-compat|...`.
+Select it by pointing the compat base URL at OpenRouter and supplying its
+`sk-or-v1-...` key through `LLM_API_KEY`:
+
+A minimal working env-file (drop into `~/.config/ai-memory/openrouter.env`
+or the Docker `--env-file` argument):
+
+```env
+LLM_API_KEY=sk-or-v1-...
+
+AI_MEMORY_LLM_PROVIDER=openai-compat
+AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
+AI_MEMORY_LLM_MODEL=deepseek/deepseek-v4-flash
+AI_MEMORY_LLM_COMPAT_STRICT=true
+```
+
+Then verify:
+
+```bash
+ai-memory llm-test --provider openai-compat \
+    --model deepseek/deepseek-v4-flash --prompt "Reply with OK"
+```
+
+`AI_MEMORY_LLM_COMPAT_STRICT=true` sends OpenAI-style
+`response_format=json_schema` for every structured call. Modern hosted
+gateways honour it; some model backends (DeepSeek among them) otherwise wrap
+their JSON output in markdown fences that ai-memory's tolerant parser has to
+strip, which occasionally drops a field. Setting it to `true` at the
+env-file level is safer for consolidation reliability. Turn it off
+(`AI_MEMORY_LLM_COMPAT_STRICT=false`) only for a specific model backend that
+explicitly rejects the schema-constrained shape.
+
+The `docker/.env.production.example` file in the repo ships with an OpenRouter
+setup pre-filled, with `moonshotai/kimi-k2.6` as the sample model (see the
+gotchas below for why reasoning models are ineligible). Model ids follow
+OpenRouter's `provider/model` convention. There is no built-in default:
+`AI_MEMORY_LLM_MODEL` is required, as it is for every `openai-compat` endpoint.
+
+### Choosing a model
+
+For LLM selection guidance, see
+[`llm-provider-comparison.md`](llm-provider-comparison.md), where the project
+keeps its own A/B tests of consolidation quality, latency, and cost. That comparison uses English consolidation fixtures and covers the
+recommended default (`anthropic/claude-haiku-4.5`), the cheaper alternative
+(`openai/gpt-5.4-mini`), and the reasoning-model ineligibility note; the
+OpenRouter subsection here defers to it rather than duplicating rankings.
+
+For workloads dominated by non-English content, community reports suggest
+that a higher-recall multilingual embedder (for example `baai/bge-m3` via
+the `openai-compat` embedder) noticeably improves retrieval quality
+relative to the built-in English-only local embedder. Configuration is in
+the embedding paragraph below.
+
+ai-memory automatically layers OpenRouter's app-attribution headers
+(`HTTP-Referer` and `X-Title`) whenever the base URL points at
+`openrouter.ai`, so ai-memory traffic is credited on OpenRouter's app
+leaderboard. `AI_MEMORY_LLM_HEADERS=HTTP-Referer=https://example.com,X-Title=my-app`
+overrides them per operator. `AI_MEMORY_LLM_REASONING_EFFORT` is honoured on
+this path: OpenRouter hosts receive `reasoning: { effort, exclude: true }`.
+
+OpenRouter's LLM/completions API is what ai-memory uses above. It does **not**
+reliably expose an OpenAI-compatible `/v1/embeddings` endpoint (historically it
+has not), so do not assume an OpenRouter base URL works for the embedder. If a
+given deployment of OpenRouter does offer an embeddings endpoint, verify it
+answers the standard `/v1/embeddings` shape (`curl` the endpoint directly)
+before relying on it. When it does, configure the embedder through the
+openai-compat path rather than the openai path, which has an OpenAI-specific
+key precedence chain:
+
+```bash
+export AI_MEMORY_EMBEDDING_PROVIDER=openai-compat
+export AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1
+export AI_MEMORY_EMBEDDING_MODEL=baai/bge-m3
+export AI_MEMORY_EMBEDDING_DIM=1024
+# LLM_API_KEY is reused automatically when EMBEDDING_API_KEY is unset on
+# the openai-compat embedder path; no second key is required.
+```
+
+`AI_MEMORY_EMBEDDING_DIM` is mandatory for openai-compat embeddings and must
+match the model. For English-only content the built-in local
+sentence-transformer (`AI_MEMORY_EMBEDDING_PROVIDER=local`, see
+[`local-embeddings.md`](local-embeddings.md)) is a valid alternative that
+avoids hosted egress; for non-English content, a multilingual hosted model
+(`baai/bge-m3`, `intfloat/multilingual-e5-large`, or similar) served by any
+provider that exposes a real `/v1/embeddings` endpoint is the practical choice.
+The two endpoints are still independent, so setting `AI_MEMORY_LLM_BASE_URL`
+alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
+
+> [!TIP]
+> **`openai-compat` sends `X-Request-Id` on every chat attempt.** Each HTTP
+> attempt of one logical operation, including the strict-to-tolerant
+> fallback, carries the same operation id (a 36-character UUID v7) in the
+> `X-Request-Id` header, so a gateway that records it (for example as
+> `req=<id>`) can correlate every attempt of the same operation and forward
+> it to the engine (vLLM). The caller of the operation (the consolidation
+> invocation or the auto-improve review) generates the id fresh, and it
+> is never the agent's session id, so a gateway never sees two operations
+> of one session, or a crash-resumed run, as one. Crash re-entry is exactly
+> one new operation: a process restart or a queue re-claim mints a new id
+> for the calls it makes. The official `openai` provider and `opencode` do
+> not send this header; `opencode` keeps its own `x-opencode-session`
+> contract. Because ai-memory owns the header on the `openai-compat` path, a
+> static `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at
+> startup for that provider; the dynamic value must not be shadowed or
+> duplicated.
+
+### Security and gotchas
+
+- **Bind address vs. port publish.** When running inside a container, the
+  process-level bind (`--bind 0.0.0.0:49374` or similar) does not decide
+  who can reach the port; the container's publish spec does. `-p 127.0.0.1:49374:49374` restricts to loopback on the host;
+  `-p 49374:49374` publishes on every host interface. If the port is
+  ever reachable beyond loopback, generate a bearer token first:
+  ```bash
+  ai-memory generate-auth-token
+  export AI_MEMORY_AUTH_TOKEN=<token>
+  export AI_MEMORY_ALLOWED_HOSTS=<host,host,...>
+  ```
+  The server logs a loud startup warning about non-loopback exposure
+  without a token; treat it as blocking. `AI_MEMORY_ALLOWED_HOSTS`
+  guards against DNS-rebinding. TLS termination is expected to sit in
+  front of the process; see [`docs/https-via-proxy.md`](https-via-proxy.md).
+- **Secret hygiene.** The env file that holds `LLM_API_KEY` (and any
+  provider-specific key you set) should be `chmod 600` and outside any
+  directory a version-control tool sees. If you back up
+  `~/.config/ai-memory/` (see [`docs/backup.md`](backup.md)), exclude
+  the env file. The sample script and mirror `.gitignore` shipped
+  there already exclude `*.env` by default.
+- **Cheap models can drift.** LLM consolidation writes durable wiki
+  pages, so a model that occasionally fabricates a `kind: decision`
+  page for a session that made no decision leaves a page in the wiki
+  that ai-memory will treat as first-class evidence on subsequent
+  reads. This is a known cost of running a smaller / cheaper model on
+  the consolidation prompt. Spot-check
+  `<data_dir>/wiki/<workspace>/<project>/decisions/` during the first
+  week on a new model for pages you do not recognize; if any appear,
+  either raise the provider tier for consolidation only (keep the
+  cheaper model for retrieval reranking) or unset
+  `AI_MEMORY_LLM_PROVIDER` to fall back to the deterministic
+  rule-based path.
+- **`:free`-suffix models draw from a shared quota.** Any model id
+  ending in `:free` on OpenRouter is served from a pool shared across
+  all users of the free tier, not the caller's paid budget. When that
+  pool is exhausted, requests fail with an upstream-shared-pool
+  rate-limit error. They are fine for evaluation but unreliable for
+  production; prefer a model listed with multiple upstream providers on its
+  OpenRouter page.
+- **Reasoning-mode models are ineligible for consolidation.**
+  Consolidation and lint use a strict-JSON output contract; reasoning
+  models route most of their token budget through internal reasoning
+  and either stall past the 300 s per-request ceiling or return empty
+  strings. `docs/install.md#llm-provider-tiers` has the standing "what
+  we don't recommend" note listing the pattern; the same applies to
+  any OpenRouter model flagged as a reasoning/thinking variant. Prefer
+  a non-reasoning peer for `AI_MEMORY_LLM_MODEL`.
+
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run
-`claude setup-token` once, then set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` and
-`ANTHROPIC_OAUTH_TOKEN=<token>` (or `CLAUDE_CODE_OAUTH_TOKEN`, which `claude
-setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed. The Docker
+`claude setup-token` once; it prints the token and does not save it anywhere, so
+export it yourself as `ANTHROPIC_OAUTH_TOKEN=<token>` (or
+`CLAUDE_CODE_OAUTH_TOKEN`) and set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth`. No
+`ANTHROPIC_API_KEY` is needed. The Docker
 wrappers forward either token by name to short-lived helper commands such as
 `llm-test`; configure the long-lived server container separately as shown in the
 installation guide.
@@ -95,9 +316,17 @@ non-default sampling parameters. `llm-test` sends the same representative 0.2
 value as the normal pipeline before the provider applies that compatibility
 rule.
 
-**⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
+**⚠️ Unofficial and against Anthropic's usage policies. Use at your own risk;
 it may get your account rate-limited or banned. See
-[the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
+[the warning in `docs/install.md`](install.md#anthropic-via-claude-subscription-oauth).**
+
+Anthropic currently refuses subscription tokens from third-party apps
+([legal and compliance](https://code.claude.com/docs/en/legal-and-compliance)),
+so expect `anthropic-oauth` to fail on every request, typically with
+`provider error 429` and `rate_limit_error`, even though the same token works
+in the `claude` CLI. That 429 is a policy refusal, not a real rate limit. Use
+the `anthropic` provider with an Anthropic Console API key, or another provider
+from the table above.
 
 `copilot` stores a GitHub user token in the same auth file, exchanges it for a
 short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
@@ -105,12 +334,19 @@ uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
 also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 
 > [!TIP]
-> **For the OAuth/subscription backends (`anthropic-oauth`, `openai-oauth`, `codex`,
-> `copilot`), pick a small, fast model** via `AI_MEMORY_LLM_MODEL` — e.g.
-> `claude-haiku-4-5` or `gpt-5-mini`. ai-memory's LLM work (consolidation,
-> lint, explore) is summarisation, not hard reasoning, so a Haiku/mini-class
-> model is plenty and is much easier on subscription rate limits. Save the
-> high-effort thinking models for your coding agent.
+> **For the OAuth/subscription backends, prefer a small, fast model** via
+> `AI_MEMORY_LLM_MODEL` where the backend lets you choose one. ai-memory's LLM
+> work (consolidation, lint, explore) is summarisation, not hard reasoning, so a
+> Haiku/mini-class model is plenty and is much easier on subscription rate
+> limits. Save the high-effort thinking models for your coding agent. Per backend:
+> - `anthropic-oauth`: set `claude-haiku-4-5`.
+> - `openai-oauth` / `codex`: leave the provider default (`gpt-5.5`). The
+>   Codex/ChatGPT backend only accepts a small server-defined set of model ids
+>   and rejects others (e.g. `gpt-5-mini`) with a deterministic 400, so do not
+>   override the model here.
+> - `copilot`: a mini-class id such as `gpt-5-mini` may work, but Copilot's
+>   accepted model set is unverified. Check before relying on it, and fall back
+>   to the default if the endpoint rejects your choice.
 
 > [!TIP]
 > **OpenAI-compatible structured output is schema-constrained by default.**
@@ -128,7 +364,7 @@ headroom because provider tokenizers differ:
 
 ```toml
 [consolidation]
-max_input_tokens = 6500
+max_input_tokens = 10000
 max_output_tokens = 1000
 ```
 
@@ -137,7 +373,9 @@ The equivalent environment variables are
 `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS`. Provider failures during an
 automatic PreCompact/PostCompaction checkpoint fall back to the deterministic
 rule-based page; admission, storage, and scope errors still fail closed. The
-validated minimums are 6,000 input and 1,000 output tokens.
+validated minimums are 8,350 input and 1,000 output tokens at the default
+`input_token_safety_margin` of 0.8; a lower margin shrinks the character budget
+and needs a proportionally larger input target.
 
 Every chat provider bounds each completion request at 300 seconds
 (`AI_MEMORY_LLM_TIMEOUT_SECS` to override, or `llm_timeout_secs = 900` in
@@ -167,14 +405,70 @@ engines (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
 `AI_MEMORY_EMBEDDING_DIM`. The optional `EMBEDDING_API_KEY` credentials the
 embedder alone and is checked before `OPENAI_API_KEY` and `LLM_API_KEY`, so
-embeddings can run on a different provider than the LLM. Both the FTS-only and
+embeddings can run on a different provider than the LLM. Because the two
+endpoints are independent, `AI_MEMORY_LLM_BASE_URL` redirects only the LLM;
+set `AI_MEMORY_EMBEDDING_BASE_URL` as well or embedding traffic still goes to
+the embedding provider's default endpoint. Both the FTS-only and
 hybrid paths apply the same bounded page-authority adjustment after candidate
 generation; embeddings improve relevance recall but do not decide which source
 is canonical.
 
+Asymmetric embedding models, trained with a different instruction for
+queries than for the text being indexed, need that instruction added to the
+text itself; the OpenAI-compatible `/v1/embeddings` wire format has no field
+for it. `AI_MEMORY_EMBEDDING_QUERY_PREFIX` and
+`AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX` (only applied by the `openai` and
+`openai-compat` embedders) are prepended to query and document text
+respectively, before the existing truncation, so a long body is still
+truncated to the same overall input cap with the prefix included. Both are
+empty by default (no behaviour change when unset) and are not trimmed, so
+a publisher's trailing space is preserved exactly. For example, NVIDIA's
+[`nvidia/Nemotron-3-Embed-1B-BF16`](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16)
+(2048-dim, served locally through vLLM/`openai-compat`) specifies
+`"query: "` for queries and `"passage: "` for documents per its model card:
+
+```toml
+embedding_provider = "openai-compat"
+embedding_model = "nvidia/Nemotron-3-Embed-1B-BF16"
+embedding_base_url = "http://localhost:8000/v1"
+embedding_dim = 2048
+embedding_query_prefix = "query: "
+embedding_document_prefix = "passage: "
+```
+
+Base E5 models (`intfloat/e5-base-v2`, `e5-large-v2`, multilingual E5, …)
+use the same `"query: "` / `"passage: "` convention. Instruction-tuned E5
+variants and Qwen3-Embedding instead need a task-instruction string on the
+**query side only** (their documents are embedded plain, with no document
+prefix), and the two use **different exact spacing**, confirmed against
+each model card:
+
+- `intfloat/e5-mistral-7b-instruct`:
+  `embedding_query_prefix = "Instruct: {task description}\nQuery: "`, with a
+  trailing space after `Query:`.
+- `Qwen/Qwen3-Embedding-0.6B` (and the other Qwen3-Embedding sizes):
+  `embedding_query_prefix = "Instruct: {task description}\nQuery:"`, with **no**
+  trailing space; the query text follows the colon directly.
+
+Fill in your own task description for `{task description}`, leave
+`embedding_document_prefix` unset for both, and don't copy one model's
+exact string for the other. The trailing-space difference is
+publisher-specified, not a typo.
+
+Changing `embedding_query_prefix` alone never requires re-embedding: only
+`embedding_document_prefix` is folded into the stored embedding identity
+(a non-empty value changes what `ai-memory` treats as the current
+`{provider, model, dim}` triple for that page's vectors), so a document
+prefix change makes `memory_query` stop matching the old vectors and the
+next `ai-memory embed` (scheduled or manual) pass re-embed them
+automatically, without `--force`. `--force` remains useful to
+re-embed everything immediately rather than waiting for scheduled
+backfill, or to force a re-embed for a reason the triple alone doesn't
+capture (e.g. touching up the vLLM server's tokenizer or quantization).
+
 `AI_MEMORY_EMBEDDING_PROVIDER=copilot` reuses the same Copilot OAuth login as
 the `copilot` LLM provider (`ai-memory auth login copilot` or
-`COPILOT_GITHUB_TOKEN`/`GITHUB_COPILOT_API_TOKEN`) — no separate API key.
+`COPILOT_GITHUB_TOKEN`/`GITHUB_COPILOT_API_TOKEN`), with no separate API key.
 It defaults to model `text-embedding-3-small`, dim 1536, and calls Copilot's
 `/embeddings` endpoint following the same OpenAI-compatible contract Copilot
 documents for chat. That endpoint's exact shape is not covered by a live
@@ -184,9 +478,10 @@ before relying on it in production.
 `AI_MEMORY_EMBEDDING_PROVIDER=local` needs no key and no server at all:
 sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
 384-dim), with the model fetched once into `<data_dir>/models/` under
-pinned checksums — see [`docs/local-embeddings.md`](local-embeddings.md).
+pinned checksums; see [`docs/local-embeddings.md`](local-embeddings.md).
 
-See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
-for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter examples, and
-[`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md)
+See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
+for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra
+examples, and
+[`docs/llm-provider-comparison.md`](llm-provider-comparison.md)
 for the empirical model comparison.

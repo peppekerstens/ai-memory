@@ -17,7 +17,7 @@ Use this skill for single-use cross-session handoffs. Handoffs are for the next 
 
 ## Single-use handoff behavior
 
-The SessionStart hook usually fetches and consumes any pending handoff before the agent sees its first prompt. If the current context already contains a pending handoff block, answer from that block directly. Do not call the accept tool again to find it in another project, because handoffs are single-use and the tool will normally return null after SessionStart consumed it.
+The SessionStart hook usually fetches and consumes any pending handoff before the agent sees its first prompt. If the current context already contains a pending handoff block, answer from that block directly. Do not call the accept tool again to find it in another project, because handoffs are single-use: after SessionStart consumed it the tool returns no handoff, with `status` `consumed_by_hook` when the client forwards its session id and `none_pending` otherwise.
 
 If no pending handoff block is visible, inspect with `memory_handoff_list` first. Listing does not claim or expire anything. When the user asks where we left off, claim one listed row with `memory_handoff_accept` and that `handoff_id`, using the client-aware project scope below. Do not treat list as a second accept path.
 
@@ -40,6 +40,6 @@ Accept and cancel normally act only on the caller's own plus shared handoffs. `a
 Choose scope from the MCP client's identity support:
 
 - **Session-aware MCP clients** that forward the real lifecycle-hook session id on every request should use automatic current-project routing. Omit `workspace`, `project`, and `cwd` for the current repository; pass explicit scope only when the user names a different project.
-- **Static MCP clients** (including clients with lifecycle hooks but no bridge connecting that hook session id to MCP requests) must pass `workspace` and `project` together on every project-scoped call, including requests about this project, here, or our work. Read the exact names from the nearest `.ai-memory.toml` when it declares both. If it does not, obtain the names from the operator or server configuration; never guess them from a directory name and never rely on the server's last active project.
+- **Static MCP clients** (including clients with lifecycle hooks but no bridge connecting that hook session id to MCP requests) must pass `workspace` and `project` together on every project-scoped call, including requests about this project, here, or our work. Read the exact names from the nearest `.ai-memory.toml` when it declares both. Without a marker override, derive the project from normalized `upstream`, then `origin`, using the full repository path without its host (`github.com/acme/api` → `acme-api`); use the folder basename only when no valid remote exists. Never rely on the server's last active project.
 
 This rule applies only to project-scoped calls. For cross-project retrieval, `global=true` must omit `workspace`, `project`, and `scopes`. For a standing preference written with `scope: "global"`, omit `workspace` and `project`.

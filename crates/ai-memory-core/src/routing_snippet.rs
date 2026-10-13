@@ -42,9 +42,11 @@ for cross-session continuity.
   connecting that hook session id to MCP requests) must pass `workspace` and
   `project` together on every project-scoped call, including requests about "this
   project", "here", or "our work". Read the exact names from the nearest
-  `.ai-memory.toml` when it declares both. If it does not, obtain the names from
-  the operator or server configuration; never guess them from a directory name
-  and never rely on the server's last active project.
+  `.ai-memory.toml` when it declares both. Without a marker override, derive the
+  project from the normalized `upstream` remote, then `origin`, using the full
+  repository path without its host (`github.com/acme/api` → `acme-api`); use the
+  folder basename only when no valid remote exists. Never rely on the server's
+  last active project.
 
 This rule applies only to project-scoped calls. For cross-project retrieval,
 `global=true` must omit `workspace`, `project`, and `scopes`. For a standing
@@ -64,6 +66,11 @@ A reviewed decision record kept in the repository (an ADR directory, a Keep the 
 `context/` tree) is not a harness-local store: when the project keeps one, record
 decisions there under the project's convention; ai-memory keeps recall, handoffs and
 session history and does not duplicate that record as a page.
+
+Cross-project messaging exists: `memory_message_send` is the ONLY way to
+reach another project's inbox (send a report, notify, leave a message for
+that project's agent). A wiki page written into the target project is NOT a
+message and is never surfaced as one.
 
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
@@ -109,9 +116,9 @@ session start and reaches Claude Code only if the agent opens the file.
 
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
-to ai-memory's reserved global scope instead — the durable-pages skill
-covers how. Default memory reads surface global-scope pages in every
-project automatically.
+to ai-memory's cross-project profile instead (`scope: "profile"`) — the
+durable-pages skill covers how. Every project receives the profile as
+defaults at session start, below its own rules file.
 
 ### Refreshing this snippet
 
@@ -146,7 +153,7 @@ This project uses [ai-memory](https://github.com/akitaonrails/ai-memory) for cro
 Choose project scope according to the MCP client's session-identity support:
 
 - **Session-aware clients**: for the current project, omit `workspace`, `project`, and `cwd`; pass explicit scope only when the user names a different project.
-- **Static clients**: pass `workspace` and `project` together on every project-scoped call. Prefer the nearest `.ai-memory.toml` when it declares both; otherwise use operator or server configuration. Never guess scope from a directory name or rely on another session's active-project state.
+- **Static clients**: pass `workspace` and `project` together on every project-scoped call. Prefer the nearest `.ai-memory.toml` when it declares both. Without a marker override, derive the project from normalized `upstream`, then `origin`, using the full repository path without its host (`github.com/acme/api` → `acme-api`); use the folder basename only without a valid remote. Never rely on another session's active-project state.
 - For cross-project retrieval with `global=true`, omit `workspace`, `project`, and `scopes`. For durable preferences written with `scope: "global"`, omit `workspace` and `project`.
 
 ### Capture and durable memory
@@ -156,6 +163,8 @@ Lifecycle hooks automatically capture sanitized, bounded prompt and tool-lifecyc
 Do not manually record routine session activity. Write durable memory only when the user explicitly asks to remember or permanently annotate something. For time-bounded memory, set `expires_at`; expired pages are hidden from normal reads and removed by the next forget sweep, and TTL takes precedence over `pinned`.
 
 ai-memory is the cross-harness memory of record for durable project knowledge. Do not duplicate the same durable project facts in harness-local memory stores that other agents cannot see.
+
+`memory_message_send` is the only path into another project's inbox (send a report, notify, leave a message for that project's agent); a wiki page written there is not a message and is never surfaced as one.
 
 ### Retrieval and trust
 
@@ -173,7 +182,7 @@ The reserved `_prompts/consolidation.md` page may provide bounded advisory prefe
 
 Write durable project rules such as “always X” or “never Y” to the project's canonical agent instruction file, using the filename and discovery mechanism appropriate to that harness. Do not duplicate a project rule into ai-memory merely to make it persistent.
 
-Standing user or team preferences that genuinely apply across projects belong in ai-memory's reserved global scope. Default memory retrieval surfaces global-scope entries alongside project results.
+Standing user or team preferences that genuinely apply across projects belong in ai-memory's cross-project profile (`scope: "profile"`). Every project receives it as defaults at session start, below its own rules file.
 
 ### Refreshing this managed block
 
@@ -303,7 +312,9 @@ mod tests {
         assert!(SNIPPET_BODY.contains("must pass `workspace` and"));
         assert!(SNIPPET_BODY.contains("`project` together on every project-scoped call"));
         assert!(SNIPPET_BODY.contains("nearest\n  `.ai-memory.toml`"));
-        assert!(SNIPPET_BODY.contains("never rely on the server's last active project"));
+        assert!(SNIPPET_BODY.contains("normalized `upstream` remote, then `origin`"));
+        assert!(SNIPPET_BODY.contains("folder basename only when no valid remote exists"));
+        assert!(SNIPPET_BODY.contains("Never rely on the server's\n  last active project"));
         assert!(SNIPPET_BODY.contains("`global=true` must omit"));
         assert!(SNIPPET_BODY.contains("`scope: \"global\"`"));
     }

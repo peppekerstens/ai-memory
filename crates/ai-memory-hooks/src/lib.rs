@@ -21,13 +21,19 @@
 //! This crate does not read process environment directly; server configuration
 //! is resolved once by `ai-memory-cli` and threaded in as typed state.
 
+pub mod antigravity;
 mod assistant_capture;
 pub mod capture_policy;
+mod grants;
 pub mod log;
 pub mod payload;
 pub mod router;
 pub mod synth;
 pub mod workstream;
+
+pub use antigravity::{
+    MAX_ANTIGRAVITY_OUTPUT_BYTES, enrich_antigravity_step_output, is_output_eligible,
+};
 
 // Re-export the sanitizer types from core so callers that grew up
 // pointing at this crate's `sanitize` module keep working.
@@ -40,8 +46,9 @@ pub use assistant_capture::{
 };
 pub use capture_policy::{
     CaptureConfig, CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy,
-    CaptureProtocol, CaptureSource, ExtractionState, PolicyState, ToolFamily,
-    repository_admits_capture,
+    CaptureProtocol, CaptureSource, ExtractionState, GlobStep, GlobWalk, PolicyState, ToolFamily,
+    absolute_tool_location_paths, capture_lookup_locations, describe_invalid_capture_config,
+    glob_segment_matches, glob_walk, repository_admits_capture, tool_call_payload, valid_call_id,
 };
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,
@@ -54,6 +61,17 @@ pub use router::{
 };
 pub use synth::synthesize_session_page;
 pub use workstream::{WorkstreamState, workstream_router};
+
+/// Request header every first-party client (native hook and CLI, the shell and
+/// PowerShell hook bundles, the generated TypeScript integrations) sends to the
+/// server's machine routes. The value names the client kind and is
+/// informational; the server only checks that the header is present.
+///
+/// A web page cannot attach a custom header to a cross-site request without a
+/// CORS preflight, and the machine routes answer no preflight, so the header
+/// separates a first-party client from a page in the operator's browser where
+/// fetch metadata is absent (see `serve`'s browser guard).
+pub const CLIENT_MARKER_HEADER: &str = "x-ai-memory-client";
 
 // Integration tests compile into this crate's test harness instead of a
 // separate binary: every test binary is another link and, on macOS and

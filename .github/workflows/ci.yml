@@ -16,6 +16,13 @@ env:
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes its in-flight run, so cancel it.
+# Pushes to main and manual dispatches are never cancelled: each is the record
+# for its commit (a dispatch is the pre-release matrix on an exact SHA).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fmt:
     name: rustfmt
@@ -70,12 +77,63 @@ jobs:
       - name: Regenerate the Tailwind bundle
         if: matrix.os == 'ubuntu-latest'
         run: echo "TAILWIND_BUILD=1" >> "$GITHUB_ENV"
-      - run: cargo test --workspace --all-targets
+      # nextest runs every test binary's tests in parallel across the runner's
+      # cores; `cargo test` ran the binaries one after another, which was most
+      # of this job's wall clock. Profile `ci` (.config/nextest.toml) runs every
+      # tier, including slow::/stress::, with no retries.
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --all-targets --profile ci
+      # `--all-targets` deliberately excludes doctests, so a doc-comment code
+      # block that fails to compile (e.g. an indented shell example rustdoc
+      # reads as Rust) shipped unnoticed. Run them explicitly.
+      - run: cargo test --workspace --doc
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+      - name: Build the external lifecycle relay
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo build --locked --manifest-path companions/ai-memory-relay/Cargo.toml
+      - name: External lifecycle delivery against the real server
+        run: >
+          uv run --no-project python tests/e2e/external_relay_smoke.py
+          --ai-memory-bin "${{ github.workspace }}/target/debug/ai-memory"
+          --relay-bin "${{ github.workspace }}/target/debug/ai-memory-relay"
+      # The Jev reranker adapter under docs/examples is stdlib Python with its
+      # own unittest suite; nothing else runs it. `unittest discover` exits 5
+      # when it finds no tests, so the step skips cleanly until a test file
+      # exists there.
+      - name: Jev reranker adapter example tests
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          dir=docs/examples/jev-reranker-adapter
+          if compgen -G "$dir/test_*.py" > /dev/null; then
+            uv run --no-project python -m unittest discover -s "$dir" -p 'test_*.py' -v
+          else
+            echo "no tests under $dir"
+          fi
+      # The capture policy every generated OpenCode/OMP/Pi/OpenClaw plugin
+      # embeds is TypeScript; only Node can execute it against the shared
+      # capture-policy fixture. The test is ignored locally, where Node is not
+      # a build requirement.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          node-version: "24"
+      - name: Generated capture-policy TypeScript runtime evidence
+        if: matrix.os == 'ubuntu-latest'
+        # `--workspace` reuses the test binaries built above instead of
+        # re-resolving features for one package.
+        run: cargo test --workspace --lib -- --ignored --exact commands::render_shared::tests::generated_capture_policy_v1_node_runtime_evidence
       - name: Vendored tailwind.css is current
         if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- crates/ai-memory-web/static/tailwind.css
 
-  # Native Windows coverage lives in `.github/workflows/windows.yml`: it
+  # Native Windows *test* coverage lives in `.github/workflows/windows.yml`: it
   # runs nightly, on demand, and on any pull request carrying the `windows`
   # label. It was ~1000s here against ~250s for the
   # same tests on Linux, which meant every pull request waited roughly
@@ -83,14 +141,51 @@ jobs:
   # and it was `continue-on-error`, so those extra minutes gated nothing.
   # Add the `windows` label to a pull request that touches path handling,
   # file locking, or git plumbing.
+  #
+  # `windows-cross` below is the cheap per-merge complement: it cross-*builds*
+  # the Windows target from Linux, so a `#[cfg(windows)]` compile or link break
+  # is caught in this ~8-minute gate instead of at release time. It does NOT run
+  # tests — cross-compiling proves the code builds and links for Windows, not
+  # that it behaves correctly there. Wine is deliberately not used to fake a
+  # runtime: it cannot faithfully reproduce native PowerShell, NTFS
+  # case-folding, Win32 file-locking/sharing-violation semantics, or verbatim
+  # (`\\?\`) path handling — exactly the surface windows.yml (and the local
+  # dockur VM loop, see docs/design-windows-ci.md) exist to validate.
+  windows-cross:
+    name: windows cross-build (msvc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pin to 1.95 to match rust-toolchain.toml: that file overrides the
+      # active toolchain inside the repo, so the MSVC target's std must be added
+      # to 1.95 (not `stable`) or the cross-build fails with "can't find crate
+      # for `core`".
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.95
+        with:
+          toolchain: "1.95"
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: windows-cross
+      # cargo-xwin drives clang-cl / lld-link against an auto-downloaded MSVC
+      # CRT + Windows SDK, so bundled SQLite and vendored libgit2 (both C) build
+      # for the target without a Windows host.
+      - name: Install clang/lld toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm lld
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin --locked
+      # --all-targets so the `#[cfg(windows)]` test binaries compile too — that
+      # is the class of break (a test that only compiles on Windows) this gate
+      # is here to catch before it reaches windows.yml or a release.
+      - run: cargo xwin build --workspace --all-targets --target x86_64-pc-windows-msvc
 
-  # The companion importer is deliberately outside the root workspace
-  # (its own [workspace] in companions/ai-memory-importer/Cargo.toml), so
-  # none of the jobs above compile it. Gate it here with the same
-  # fmt/clippy/test trio docs/companion-crates.md prescribes, or a
-  # toolchain bump / convention change rots it silently.
+  # Companions have their own workspaces and need separate checks.
   companions:
-    name: companions (ai-memory-importer)
+    name: companions (${{ matrix.companion }})
+    strategy:
+      fail-fast: false
+      matrix:
+        companion: [ai-memory-client, ai-memory-importer, ai-memory-relay, ai-memory-wikisync]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -99,10 +194,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
-          workspaces: companions/ai-memory-importer
-      - run: cargo fmt --check --manifest-path companions/ai-memory-importer/Cargo.toml
-      - run: cargo clippy --manifest-path companions/ai-memory-importer/Cargo.toml --all-targets -- -D warnings
-      - run: cargo test --manifest-path companions/ai-memory-importer/Cargo.toml
+          workspaces: companions/${{ matrix.companion }}
+      - run: cargo fmt --check --manifest-path companions/${{ matrix.companion }}/Cargo.toml
+      - run: cargo clippy --locked --manifest-path companions/${{ matrix.companion }}/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path companions/${{ matrix.companion }}/Cargo.toml
 
   # Build the release binary on its own so a release-only failure
   # (LTO crash, codegen issue, dead-code-with-debug-assertions) doesn't
@@ -156,6 +251,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y rpm
       - run: scripts/check-native-packaging.sh
       - run: tests/wrapper_upgrade.sh
 
@@ -242,7 +338,7 @@ jobs:
         with:
           name: ci-ai-memory-linux-x86_64
           path: dist/docker/ai-memory-linux-x86_64
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: build image (local tag only)
         run: docker build --target runtime-prebuilt-amd64 -f docker/Dockerfile -t ai-memory:ci .
       - name: --version smoke
@@ -266,6 +362,13 @@ jobs:
           log-level: warn
           command: check
           arguments: --all-features
+      - name: Relay dependency policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          log-level: warn
+          command: check
+          manifest-path: companions/ai-memory-relay/Cargo.toml
+          arguments: --all-features
 
   audit:
     name: cargo-audit
@@ -279,8 +382,10 @@ jobs:
           cargo audit
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0320
-          --ignore RUSTSEC-2026-0194
-          --ignore RUSTSEC-2026-0195
+      - run: cargo audit --file companions/ai-memory-relay/Cargo.lock
+      - run: cargo audit --file companions/ai-memory-importer/Cargo.lock
+      - run: cargo audit --file companions/ai-memory-client/Cargo.lock
+      - run: cargo audit --file companions/ai-memory-wikisync/Cargo.lock
 
   gitleaks:
     name: gitleaks (secret scan)

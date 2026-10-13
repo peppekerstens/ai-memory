@@ -35,6 +35,7 @@ fn tuning(session_recall: bool, bonus: f64, abstract_vectors: bool) -> Retrieval
         session_recall_routing: session_recall,
         session_recall_bonus: bonus,
         abstract_vectors,
+        belief_authority_weight: 0.0,
         ..RetrievalTuning::default()
     }
 }
@@ -105,6 +106,7 @@ async fn session_recall_routing_flips_session_page_ranking() {
             0,
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -124,6 +126,7 @@ async fn session_recall_routing_flips_session_page_ranking() {
             0,
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -146,6 +149,7 @@ async fn session_recall_routing_flips_session_page_ranking() {
             0,
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -234,6 +238,7 @@ async fn abstract_vector_stream_is_opt_in() {
             dim,
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -255,6 +260,7 @@ async fn abstract_vector_stream_is_opt_in() {
             dim,
             10,
             None,
+            false,
         )
         .await
         .unwrap();

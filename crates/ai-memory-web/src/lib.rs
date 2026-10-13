@@ -12,7 +12,10 @@
 //! - `GET /w/:workspace/:project`         → page tree + recent activity
 //! - `GET /w/:workspace/:project/p/*path` → rendered markdown + metadata
 //! - `GET /search?q=…`                    → FTS5 hit list
-//! - `GET /static/*`                      → embedded CSS + logo
+//! - `GET /pending`                       → root-only pending-writes triage;
+//!   its buttons post to `/admin/pending-writes/*`, not to this crate
+//! - `GET /login` / `GET /change-password` → public human-auth HTML forms
+//! - `GET /static/*`                      → embedded CSS + logo (public)
 //!
 //! The companion `api_router` exposes the same read-only data as JSON
 //! for custom frontends. It intentionally does not expose write/admin
@@ -27,12 +30,14 @@ use ai_memory_store::ReaderPool;
 use ai_memory_wiki::Wiki;
 use axum::Router;
 
+mod html_auth;
 mod markdown;
 pub mod mount;
 mod routes;
 mod state;
 mod templates;
 
+pub use html_auth::{HtmlAuthRedirectConfig, html_auth_redirect_mw, sanitize_next};
 pub use mount::{
     SplitWebRouters, WebMountSpec, inject_base_href, inject_base_path_meta, normalize_prefix,
     split_web_routers, web_base_href,
@@ -49,9 +54,9 @@ pub fn router(reader: ReaderPool, wiki: Wiki) -> Router {
 
 /// Build the read-only JSON API router for third-party web UIs.
 ///
-/// The host should `nest("/api/v1", api_router(...))` alongside `/web`
-/// so custom frontends can browse memory without reading SQLite or wiki
-/// files directly.
+/// The host should `nest("/api/v1", api_router(...))` behind its normal auth
+/// boundary, with or without `/web`, so external clients can browse memory
+/// without reading SQLite or wiki files directly.
 pub fn api_router(reader: ReaderPool, wiki: Wiki) -> Router {
     let state = Arc::new(WebState::new(reader, wiki));
     routes::build_api(state)

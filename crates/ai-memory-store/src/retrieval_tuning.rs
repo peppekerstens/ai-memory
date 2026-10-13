@@ -5,7 +5,7 @@
 //!
 //! * **Session-recall routing** — a zero-LLM lexical check that recognises
 //!   queries phrased as "find a past session / what did we do back then"
-//!   ("上次 / 之前那次…的会话 / last time / yesterday …"). Session pages
+//!   ("上次 / 之前那次…的会话 / last time / yesterday / última sessão …"). Session pages
 //!   otherwise carry a bounded authority penalty (kind `session` −0.15,
 //!   tier `episodic` −0.08, ×0.77 combined) because they are rarely the
 //!   right answer to a fact query — but a query that is *about* a past
@@ -50,6 +50,19 @@ pub struct RetrievalTuning {
     /// Add the L0 abstract-embedding stream to the RRF fusion. Reads
     /// `page_abstract_embeddings`; contributes nothing while it is empty.
     pub abstract_vectors: bool,
+    /// Weight of the belief-strength confidence factor folded into
+    /// [`crate::belief`] page authority (P2,
+    /// `docs/design-hindsight-borrowings.md` §3). `0.0` (the default) leaves
+    /// ranking byte-identical to a store that never heard of belief strength:
+    /// no belief query runs and the authority factor is untouched. When
+    /// positive, a page's derived `confidence` adds up to `weight * confidence`
+    /// to its authority factor, still clamped inside the existing `[0.55,
+    /// 1.50]` bounds — one more bounded factor, never a new multiplier tower.
+    ///
+    /// Ships OFF: this changes retrieval ranking, so per the design it must not
+    /// default on without a positive R2 delta (retrieval-triple / QA), not yet
+    /// performed.
+    pub belief_authority_weight: f64,
     /// Token budget of the FTS5 `snippet()` excerpt on a lexical hit.
     /// FTS5 accepts 1 to 64 and fails the query outside that range, so
     /// [`RetrievalTuning::sanitised`] clamps the value.
@@ -87,6 +100,9 @@ impl Default for RetrievalTuning {
             // matters more than session recall.
             session_recall_bonus: 0.25,
             abstract_vectors: false,
+            // OFF by default: folding belief confidence into ranking is
+            // R2-gated (see the field doc).
+            belief_authority_weight: 0.0,
             snippet_tokens: SNIPPET_TOKENS_DEFAULT,
             descriptor_chars: DESCRIPTOR_CHARS_DEFAULT,
         }
@@ -160,6 +176,19 @@ const SESSION_RECALL_EN: &[&str] = &[
     "earlier we",
     "previously",
 ];
+// Require an explicit historical phrase: "sessão", "antes", or "ontem"
+// alone also occur in technical queries unrelated to recalling our work.
+const SESSION_RECALL_PT_BR: &[&str] = &[
+    "última sessão",
+    "ultima sessao",
+    "última sessao",
+    "ultima sessão",
+    "sessão anterior",
+    "sessao anterior",
+    "onde paramos ontem",
+    "decisão anterior",
+    "decisao anterior",
+];
 
 /// Route a query to session-recall retrieval by lexical markers. Deliberately
 /// zero-LLM: it gates a bounded ranking nudge, not a retrieval mode, and a
@@ -171,6 +200,7 @@ pub fn is_session_recall_query(query: &str) -> bool {
     SESSION_RECALL_ZH.iter().any(|m| lowered.contains(m))
         || SESSION_RECALL_EN
             .iter()
+            .chain(SESSION_RECALL_PT_BR.iter())
             .any(|m| padded.contains(&format!(" {m} ")))
 }
 
@@ -199,6 +229,7 @@ mod tests {
         let t = RetrievalTuning::default();
         assert!(!t.session_recall_routing);
         assert!(!t.abstract_vectors);
+        assert_eq!(t.belief_authority_weight, 0.0);
         assert_eq!(t.snippet_tokens, SNIPPET_TOKENS_DEFAULT);
         assert_eq!(t.descriptor_chars, DESCRIPTOR_CHARS_DEFAULT);
     }
@@ -267,5 +298,53 @@ mod tests {
     fn latin_markers_respect_word_boundaries() {
         assert!(!is_session_recall_query("unknown snowfall"));
         assert!(is_session_recall_query("what did we ship yesterday"));
+    }
+
+    #[test]
+    fn detects_portuguese_session_recall_queries() {
+        for q in [
+            "o que fizemos na última sessão",
+            "o que fizemos na ultima sessao",
+            "o que fizemos na última sessao",
+            "o que fizemos na ultima sessão",
+            "onde paramos ontem",
+            "lembre a decisão anterior",
+            "lembre a decisao anterior",
+            "o que discutimos na sessão anterior",
+            "o que discutimos na sessao anterior",
+            "ONDE PARAMOS ONTEM?",
+            "lembre a (DECISÃO ANTERIOR), sobre SQLite",
+        ] {
+            assert!(is_session_recall_query(q), "{q}");
+        }
+    }
+
+    #[test]
+    fn portuguese_markers_require_history_and_word_boundaries() {
+        for q in [
+            "erro na sessão do usuário",
+            "erro na sessao do usuario",
+            "a sessão passada para o middleware é nula",
+            "sessao passada como parametro",
+            "sessão expira",
+            "sessao expira",
+            "antes de salvar",
+            "sessão",
+            "sessao",
+            "antes",
+            "ontem",
+            "decisão",
+            "anterior",
+            "o que fizemos agora",
+            "onde paramos o serviço",
+            "penúltima sessão",
+            "penultima sessao",
+            "decisão anteriormente tomada",
+            "decisao anteriormente tomada",
+            "xonde paramos ontem",
+            "onde paramos ontemx",
+        ] {
+            assert!(!is_session_recall_query(q), "{q}");
+        }
     }
 }

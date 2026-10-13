@@ -7,30 +7,64 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
-**`ai-memory run` is the preferred way to start a harness — "if in doubt, run
-with ai-memory."** Beyond session continuity, the first time it launches a given
-harness it **auto-installs that harness's ai-memory hooks and MCP** if they are
+`ai-memory run` is the preferred way to start a harness: if in doubt, run
+with ai-memory. Besides session continuity, the first time it launches a given
+harness it auto-installs that harness's ai-memory hooks and MCP if they are
 not already wired, so capture and recall work without a separate `install-hooks`
 / `install-mcp` step (a common footgun: `ai-memory run kimi` used to capture
 nothing if the Kimi hooks were never installed). Auto-wire is idempotent and
-one-time per harness + binary version, preserves unrelated user config, runs
-before the harness starts so it picks up the fresh hooks, and is best-effort —
-if an install fails it warns and still launches. Harnesses without installer
+one-time per harness, binary version and install location (a second config home,
+such as another `CLAUDE_CONFIG_DIR`, gets its own first launch; `ai-memory
+uninstall` of hooks or MCP clears that record, so the next launch wires again).
+It preserves unrelated user config, runs before the harness starts so it picks
+up the fresh hooks, and is best-effort: if an install fails it warns and still
+launches. Harnesses without installer
 support (Crush) are skipped; Pi wires hooks but has no MCP client to write. Turn
 it off with `ai-memory run --no-autowire`, `AI_MEMORY_RUN_AUTOWIRE=false`, or
 `run_autowire = false` in config; manual `install-hooks` / `install-mcp` remain
 available for harnesses you never launch through `run`.
 
-The launcher resolves its executable name through `PATH` directly — it does
+The launcher resolves its executable name through `PATH` directly. It does
 not go through an interactive shell, so a `claude` defined only as a shell
 `alias` in `.bashrc`/`.zshrc` is invisible to it. If you switch Claude
 accounts by alias, put a same-named script or shim earlier on `PATH` instead
 (or pass `--executable PATH`, which also resolves a bare name through
 `PATH`), so the resolved `claude` process actually is the one you meant.
 
+Named launch profiles persist repeated per-account environment overrides
+in the same `config.toml` the client loads:
+
+```toml
+[run.profiles.work.env]
+CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
+ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+```
+
+```bash
+ai-memory run --profile work claude --model opus
+```
+
+Profiles are env-only by design; executable paths, native arguments, `--yolo`,
+and auto-wire choices stay explicit on the command line. The child inherits
+the normal process environment, then profile values override it,
+`--env-file` overrides the profile, and repeated `--env` entries win last.
+The resolved values also drive native-session discovery and auto-wire, so all
+three use the same account/config home. An unknown or invalid profile fails
+before ai-memory takes a workstream lease or starts a harness. Profile names
+use up to 64 ASCII letters, digits, `.`, `_`, or `-`; each profile may contain
+up to 128 environment entries. Because values are literal and may include
+credentials, protect `config.toml` like any other local secret-bearing config.
+
+`--profile` is wrapper-owned only before the harness name. A later flag remains
+native argv, which keeps OMP's own profile selector unambiguous:
+
+```bash
+ai-memory run --profile work omp --profile omp-work
+```
+
 **Multiple Claude accounts (e.g. Corporate and Personal).** Any harness name
 starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
-and always selects the Claude harness — the exact spelling never changes
+and always selects the Claude harness. The exact spelling never changes
 the agent kind, session store, or transcript import.
 Combine that wildcard with `--executable` to launch the right account's
 binary while keeping each account's managed workstream distinguishable in
@@ -69,10 +103,23 @@ ai-memory run kiro --v3
 ai-memory run
 ```
 
+After an interactive managed session exits successfully, `ai-memory run` offers
+the installed harnesses, a way to run the current harness again, and quit.
+Choosing another harness keeps the same workstream selected, so its saved
+context remains available to the next run. The prompt defaults to quit. It
+appears only when stdin, stdout, and stderr are terminals, the managed launch
+was a session, and `--executable` was not used; utility commands, failed or
+interrupted exits, and non-interactive launches do not prompt. A switch or
+re-run does not replay the previous harness's native arguments, which may be
+specific to that CLI; wrapper settings such as `--workspace`, `--project`,
+`--yolo` / `--true-yolo`, ai-jail controls, `--no-autowire`, `--env`, and
+`--env-file` remain in effect. The initial `--fresh` choice applies only to the
+first launch.
+
 Everything after the harness name is native argv except the wrapper-owned exact
-flags `--yolo` and `--fresh`. No `--` separator is needed, and ai-memory does
-not maintain a second copy of each harness's option schema. Other wrapper
-options come first:
+flags `--yolo`, `--fresh`, and `--force-unlock`. No `--` separator is needed,
+and ai-memory does not maintain a second copy of each harness's option schema.
+Other wrapper options come first:
 
 Portable events, handoffs, and project briefs are injected as explicitly
 delimited, untrusted historical data. Instruction-like text inside stored
@@ -84,7 +131,8 @@ file, and the current checkout remain authoritative.
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
-              [--yolo] [--fresh]
+              [--yolo] [--fresh] [--force-unlock] [--profile NAME]
+              [--env KEY=VALUE]... [--env-file PATH] [--require-server]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
@@ -92,7 +140,7 @@ ai-memory run [--workspace NAME] [--project NAME]
 The default is the most recently selected workstream for the current repository
 and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
-branching controls, not harness-switch controls.
+branching controls; they do not switch harnesses.
 
 List the workstreams available to those selectors without launching a harness:
 
@@ -119,27 +167,27 @@ prints. The rename is metadata only. Names are unique per checkout, so a
 destination another workstream already holds is refused rather than merged,
 and the destination is validated exactly like a `--new` name. Because the
 ledger, linked harnesses, and managed runs all key on the workstream id rather
-than its name, nothing else moves — including which workstream a bare
-`ai-memory run` resumes, and the listing order, both of which stay put because
+than its name, nothing else moves. That includes which workstream a bare
+`ai-memory run` resumes and the listing order, both of which stay put because
 a rename deliberately does not touch `selected_at` or `updated_at`. A run that
 is already live keeps displaying the name it launched with until it exits.
 
 ## Do you need this?
 
-Probably not at first — hooks alone already carry most continuity.
+Probably not at first. Hooks alone already carry most continuity.
 
-- **Skip it** when a handoff is all you want: you quit Claude Code
+- Skip it when a handoff is all you want: you quit Claude Code
   mid-task, open Codex in the same directory, and the next session
   starts with "where you left off, what failed, what's open". That
   works with nothing but `install-hooks`; no `ai-memory run` involved.
-- **Use it** when you want the harness's own native resume (`claude
-  --resume` / the picker) to survive a harness SWITCH — the managed
-  ledger records the visible event stream portably, so `ai-memory
+- Use it when you want the harness's own native resume (`claude
+  --resume` / the picker) to survive a switch to another harness. The
+  managed ledger records the visible event stream portably, so `ai-memory
   continue` can reopen the same workstream in a different agent with
-  the exact tool-call history, not just a summary.
+  the exact tool-call history instead of a summary.
 
 If you never switch harnesses mid-workstream, the default path is
-simpler and loses you nothing.
+simpler and you lose nothing by staying on it.
 
 ## Project-first launcher
 
@@ -169,8 +217,9 @@ the same marker and repository rules as `run`. `--no-scan` uses saved links
 only, while `--workspace NAME` filters both sources. Stale, retargeted, or
 scope-mismatched links are skipped and a successful later `run` repairs the
 entry. If the server is temporarily unavailable, saved links and scan results
-remain selectable, but managed `run` still fails closed if it cannot prepare a
-workstream before launching the agent.
+remain selectable and a launch from the picker degrades exactly like any other
+`run` (see [Degraded offline launches](#degraded-offline-launches)) rather
+than failing closed; pass `--require-server` to refuse the launch instead.
 
 Interactive mode begins with `+ New project`. The launcher accepts a portable
 lowercase ASCII directory name, builds the marker, instruction routing, and
@@ -193,7 +242,7 @@ ai-memory continue --workspace work
 
 The checkout is chosen entirely on the client, from the `linked_at` stamp that
 every successful managed prepare writes to `client-projects.json`. The server
-is never asked which directory to use — it does not expose host paths, and a
+is never asked which directory to use: it does not expose host paths, and a
 link can only be trusted after this host revalidates it.
 
 Before launching, the newest link is rechecked twice: the recorded path must
@@ -212,59 +261,96 @@ directory, including automatic harness selection. `continue` therefore accepts
 
 ## Picking a workstream
 
-`ai-memory resume` is the interactive counterpart to `continue`: it presents
-recent workstreams from every valid client-local managed checkout, then launches
-the selected named workstream without needing a `cd` first.
+`ai-memory resume` presents all managed workstreams belonging to the **current
+checkout**, then launches the selected named workstream there. Other repositories
+and sibling Git worktrees are not included, even when they share a workspace,
+project name, or remote URL. Running from a subdirectory of a checkout uses that
+checkout's Git fingerprints and the nearest scope marker. To resume the newest
+linked checkout from any directory, use `ai-memory continue` instead.
 
 ```bash
 ai-memory resume
+ai-memory resume --search auth
 ai-memory resume --workspace work --limit 50
+ai-memory resume --all        # every linked checkout, current one first
 ```
 
-Use Up/Down (or `j`/`k`) to move between workstreams and Left/Right to cycle the
+`--all` restores the cross-checkout view: it walks every checkout linked to
+this server in the client-local registry (one per project), current checkout
+first, with each checkout's own fingerprint-scoped, fully paginated query;
+`--workspace` filters the registry before any request, and a checkout that can
+no longer be resolved or queried is skipped with a note.
+Listing reads the stable repository/worktree fingerprints without running
+`git status`, so a working-tree scan or filesystem-monitor hook cannot hold up
+the picker. The selected launch still captures its normal Git checkpoint.
+
+Use Up/Down to move between workstreams and Left/Right to cycle the
 launch harness for the highlighted row. Each row remembers its choice while you
 navigate. `auto` is the initial choice and preserves bare `ai-memory run`'s
 discovery of the newest usable session; the remaining choices are supported
 harness executables detected in the host `PATH`. Enter launches the displayed
-workstream/harness combination, while Escape or `q` cancels.
+workstream/harness combination. Escape clears a non-empty search, then cancels
+when the search is empty; Ctrl-C always cancels.
 
-The current selection for each checkout leads the picker, followed by recent
+Just type to filter workstream names with a case-insensitive substring search;
+there is no search mode or prefix key. Results update immediately, and every
+printable character (including `j`, `k`, `q`, and `/`) is literal search text.
+Backspace removes a character and Ctrl-U clears the query. Enter launches the
+highlighted result directly. Arrow keys navigate and switch harnesses without
+leaving the search.
+An empty result is not selectable; edit or clear the search to recover.
+
+There is no default cutoff: the CLI fetches successive bounded server pages,
+and the picker scrolls with Up/Down, PageUp/PageDown, Home, and End. `--search`
+sets the initial query. An explicit `--limit N` caps results **after** that
+initial search; clear or change the search without the limit to browse all rows.
+`--workspace` checks the current checkout's resolved workspace, rather than
+switching to another checkout.
+
+The current selection leads the picker, followed by recent
 activity. Each row identifies its workspace/project, activity age, selected
 launch harness, and already linked harnesses. Choosing a different harness is
 how an existing workstream can be continued in another agent. `--yolo` and
 `--fresh` are forwarded to the eventual managed launch.
 
-The picker seeds discovery with the current checkout and paths from this host's
-private `client-projects.json` registry. It revalidates both the canonical path
-and resolved scope before it asks the server for that checkout's workstreams,
-and deduplicates the same workstream reached through both sources. The server
+The picker does not read the private `client-projects.json` registry or fall back
+to another checkout when this one has no workstreams. It revalidates the canonical
+path and resolved scope before launching the selection. The server
 receives only the repository/worktree fingerprints required for the existing
 checkout-local listing, never a host path. It needs an interactive terminal;
 scripts can continue to use `ai-memory workstreams --json` after selecting a
-checkout themselves.
+checkout themselves. Pagination requires an updated server; if an older server
+ignores the page offset, the CLI reports that an upgrade is needed instead of
+looping forever or silently presenting a truncated list.
 
 ## Automatic harness selection
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for
 Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, and both Kiro
-CLI engines. For an empty workstream it resumes
+CLI engines. Before scanning OpenCode sessions, it probes the exact `opencode`
+executable once and uses that resolved major for discovery, launch, auto-wire,
+and transcript import. Executable lookup, the version probe, and the child launch
+share one captured environment with `--env` / `--env-file` overlays, including
+case-insensitive `PATH`/`Path` replacement on Windows. A missing, malformed,
+timed-out, or unsupported OpenCode
+probe skips only OpenCode; discovery continues with every other available
+harness. For an empty workstream it resumes
 the newest session automatically. For an established workstream, server state
 takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
 another harness merely because that file has a later timestamp. Kiro's v2 and
 v3 candidates share one server agent identity, but the selected native engine
 flavor remains exact. OMP, Grok, and Antigravity remain available explicitly
-but are not in the automatic pool. OpenCode 2 is likewise explicit-only
-(`ai-memory run opencode2`): it shares v1's session store, so listing both
-would duplicate every candidate.
+but are not in the automatic pool. OpenCode's resolved major contributes one
+adapter to the pool, so shared V1/V2 storage never duplicates a candidate.
 
 OpenCode 2 sessions run inside a shared background service, so its plugin
 cannot see a managed run's environment the way in-process plugins do. Managed
 `run opencode2` legs launch with the correct resume selectors, capture through
-hooks, and import the beta transcript — all verified live — but the
+hooks, and import the beta transcript (all verified live), but the
 ledger-delta acknowledgement (`context_delivered`) does not fire, because the
-accept path requires the run id on the session-start hook. The failure mode is
-redelivery, never loss: a later leg into another harness may receive the range
+accept path requires the run id on the session-start hook. When this fails the
+range is redelivered, never lost: a later leg into another harness may receive the range
 again. Until the beta offers per-invocation plugin context, cross-harness
 continuity into opencode2 arrives through the ordinary handoff loop rather
 than the ledger delta.
@@ -309,9 +395,24 @@ resume, continue, session, or fork selector.
 ## What happens on each run
 
 1. The host client resolves the normal workspace/project scope and a stable
-   repository plus worktree fingerprint. It opens a 90-second renewable lease.
-   One writer may own a workstream at a time, so two terminals cannot silently
-   race its native-session pointers or delivery cursors.
+   repository plus worktree fingerprint. When the project is the canonical path
+   name the checkout's git remote derives, the client also sends that remote
+   identity, and the server opens the run in the project hook capture uses for
+   the checkout: the one already carrying the identity, else the project whose
+   repository path contains the cwd, which a writer claims in place. A project
+   created from a different folder name before identities were recorded is
+   therefore reused rather than twinned under the derived name (#1182); a name
+   from `--project` or a marker routes by name as before. If an
+   identity-backed project still carries its legacy basename, this authorized write promotes the same UUID to
+   its canonical path name and refreshes the wiki scope manifest before opening
+   the lease; a post-commit manifest failure is returned as
+   `manifest_warning` on either success or a later prepare error, retaining the
+   first warning across busy retries and lease wait-out, printed once by the CLI,
+   and left for startup repair. Pure request validation, including mutually
+   exclusive workstream selectors, runs before promotion. It opens a 90-second
+   renewable lease. One writer may own a workstream at a time, so
+   two terminals cannot silently race its native-session pointers
+   or delivery cursors.
 2. Bare mode resolves the correct available harness. For an empty workstream,
    an explicit interactive adapter can offer matching local sessions for
    one-time adoption. Otherwise the adapter passes native arguments through in
@@ -321,7 +422,7 @@ resume, continue, session, or fork selector.
    not seen. Crush, which has no SessionStart hook, receives the same bounded
    packet through a temporary `options.global_context_paths` entry. Kimi Code
    fires SessionStart but discards its stdout, so the kimi adapter's
-   SessionStart hook only captures the event — it neither fetches nor links.
+   SessionStart hook only captures the event; it neither fetches nor links.
    The UserPromptSubmit hook issues the `/handoff` GET with the native
    `session_id` in the query; the server links the session and renders the
    packet atomically, and Kimi Code injects the hook's stdout as a user
@@ -331,10 +432,22 @@ resume, continue, session, or fork selector.
    Direct launches continue to use the same handoff path without a managed
    packet.
 4. When the child exits, ai-memory reads the native transcript store without
-   modifying it. Visible user/assistant messages, completed tool calls/results,
+   modifying it. A session named on the command line (or chosen before the
+   spawn) is the one it reads. Otherwise a session linked during the run under
+   its `AI_MEMORY_RUN_ID`, even the workstream's current one, is read when the
+   native store holds it for this checkout; only without such a link does it
+   look for the newest session in the checkout, which a concurrent launch
+   there could own. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
    workstream ledger. Hidden reasoning and unsupported/private records are
-   excluded and recorded as extraction-loss annotations. Each delivered
+   excluded and recorded as extraction-loss annotations. The checkout's
+   `[capture] ignore_paths` applies before upload, with the live hook's
+   decision table: an excluded tool call and its result never enter the
+   ledger, one the policy cannot prove safe keeps only its tool family, and a
+   result whose call was imported by an earlier run is dropped under a
+   policy. Messages are unaffected. Under allowlist capture mode a checkout
+   without a marker uploads no events at all, as the live hook emits none
+   there; the run still finishes. Each delivered
    workstream packet begins with a versioned origin marker. If Claude Code
    persists that packet and its `Read` tool returns it, the Claude transcript
    normalizer excludes the marked result instead of feeding delivered history
@@ -343,6 +456,13 @@ resume, continue, session, or fork selector.
 5. Imports use deterministic event ids, incremental source cursors, immutable
    sanitized JSONL segments, and bounded batches. A retry cannot duplicate
    history. The native process's exit code is preserved.
+6. Command Code, Kiro CLI and Antigravity CLI have no native session-end hook,
+   so for them the run then finalizes the session itself (again after a
+   resume), as `ai-memory finalize-session --reopen` would: summary, handoff
+   and opt-in SessionEnd consolidation. It does this only for a session named
+   on the command line, chosen before the spawn, or linked during the run,
+   never for one it had to look for. If finalizing fails, it prints the exact
+   `finalize-session` command to run instead.
 
 The next harness receives a bounded recent delta because no agent context window
 can safely absorb an unbounded transcript. The complete visible ledger remains
@@ -358,23 +478,152 @@ another shell, pass `--workstream-id <uuid>` explicitly. Search results preserve
 the source harness, role, event sequence, and content. Historical tool activity
 is labelled completed evidence and must never be replayed as a pending call.
 
+Search and tail also return optional `source_record_id` and `metadata` fields.
+The text CLI prints the source record and correlation metadata as escaped JSON;
+`--json` preserves these fields for consumers. Older server responses without
+them remain readable. Startup context packets keep their existing format and
+omit these additional fields.
+
+Source labels and string metadata values are scrubbed with the server's
+configured sanitizer **before** the 512-byte UTF-8 cap. The metadata allowlist
+matches the shipped adapters: string `tool`, `tool_call_id`, `tool_use_id`,
+`parent_id`, `summary_type`, and `status`; boolean `is_error`; signed 32-bit
+`exit_code`; and unsigned 64-bit `loss_count`. Unknown keys, nested objects,
+arrays, and wrong scalar types are discarded. Empty metadata is omitted. These
+labels describe untrusted historical evidence; they cannot grant authority,
+choose a project, or prove a tool's success independently.
+
+The same scrub and allowlist protect legacy SQLite rows during search/tail,
+without rewriting them. Malformed metadata or legacy dumps over 16 KiB return
+no metadata. Existing raw segments are not rewritten by a read. The ledger's
+FTS query, ranking, ordering, and limits remain unchanged; provenance is fetched
+in the existing event query, without additional per-result SQL reads.
+
+`event_id` remains the deduplication key. Native adapters derive it from the
+original source before provenance redaction; truncating or redacting two source
+labels therefore cannot merge distinct event ids. Repeating an event is a
+no-op when its stable identity (`agent`, `native_session_id`, `kind`) matches.
+The first indexed content, role, timestamp and provenance remain unchanged,
+even if a later upload differs or the sanitizer's patterns have changed. This
+also permits replay of legacy rows above today's write bounds; read-time
+provenance sanitization still applies. Changing the stable identity is rejected
+and the SQL batch rolls back. A rejected immutable raw segment is not indexed;
+a corrected retry can import the valid batch without advancing history for the
+rejected one. Finished runs retain the existing no-op behavior for late events,
+including new event ids; their history and latest sequence do not advance.
+
+Client event ids beginning with `managed-run:` are refused before raw storage,
+including on retries of a finished run. This namespace belongs to the server's
+checkpoint and extraction-loss events, which it appends when completing an
+active run.
+
+## Degraded offline launches
+
+When the ai-memory server is unreachable (a remote homelab down for
+maintenance, a VPN that is not up), `ai-memory run` does not abort. It probes
+the server first (any HTTP answer counts as reachable, so an older build
+without `/healthz` still passes), prints one loud warning naming the server
+URL and what the degraded run means, and launches the harness anyway:
+
+- **Lost this run**: no workstream lease or cross-harness context packet, no
+  transcript import into the ledger, and no cross-harness handoff delivery.
+  Nothing that needs the server runs: no prepare, lease, link, heartbeat,
+  context fetch, status check, finish, or import.
+- **Still works**: the harness's ai-memory lifecycle hooks (if installed) keep
+  capturing. Events spool locally and drain automatically when the server
+  returns. An existing MCP registration degrades to no-recall for the session
+  instead of blocking it (the same principle as `docs/mcp-install.md`'s
+  optional-mode entries: an unreachable memory server costs you recall, but
+  the session still runs).
+- **Sessions**: because no lease exists there is no mutual exclusion against
+  another launcher in the same checkout, so a degraded launch never adopts or
+  resumes a session implicitly. An explicit native session selector
+  (`claude --resume <id>`, `codex continue`, …) still resumes, because you named
+  the session; everything else starts a fresh session.
+- **Auto-wire**: the first-launch hook install still happens (it is local and
+  idempotent, and capture must spool offline), but no MCP entry is registered
+  for the now-unreachable server and no completion sentinel is written, so the
+  next online launch finishes the wiring. Existing registrations are never
+  touched.
+- **Attribution**: the child is launched without `AI_MEMORY_RUN_ID` /
+  `AI_MEMORY_WORKSTREAM_ID`, so its SessionEnd hook cannot attribute the
+  session to a server run that never happened.
+- **Exit code**: the child's own exit code is returned; the launch itself is
+  not an error.
+
+When the child exits, the launcher prints that the run was not recorded on the
+server and how many hook events remain spooled locally (oldest first by age).
+Spooled events are bounded: they are dropped after the configured number of
+failed drain passes (8 by default), 7 days of age, or the 10,000-file spool
+cap. For a planned outage set `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0` to disable
+only the attempt-count drops (see `docs/install.md`).
+
+If the server dies *during* a run, after the lease was acquired, the exit
+code is still preserved: the unimported transcript is reported as a warning
+with the exact `ai-memory finalize-session` command that repairs the record
+once the server is back, and the orphaned lease expires on its own within 90
+seconds.
+
+To restore the strict behavior (fail with the usual "could not reach …"
+diagnosis and never start the agent), pass `--require-server`, set
+`run.require_server = true` in `config.toml`, or export
+`AI_MEMORY_RUN_REQUIRE_SERVER=true`.
+
+## Native identity privacy
+
+New managed bindings accept the exact original native identity only when it is
+nonempty, at most 512 UTF-8 bytes, free of controls and unsafe invisible
+formatting, and unchanged by the privacy scrubber. IDs are never trimmed,
+normalized, truncated, or replaced with a redaction placeholder to make a
+binding succeed. Existing vendor IDs and generated fresh-session UUIDs remain
+supported. Each adapter retains its own path and selector restrictions.
+
+The launcher validates prepared and linked IDs from older servers before resume
+or native-store use, and validates finish identities before serialization.
+Configured privacy rules also apply to post-launch status and discovered IDs
+before transcript export and finish transport.
+HTTP ingress applies the configured privacy rules before segment writes; the
+writer also validates identities before link/import SQL, after the existing
+owner and current Write checks on finish. A refused hook auto-link still leaves
+regular sanitized shared observation capture and legacy UUID/v5 session routing
+intact. A run without a native ID keeps its existing unbound checkpoint behavior.
+
+`workstream-search --json` keeps its existing String field: an invalid historical
+`native_session_id` is returned as `""` (UNKNOWN), which cannot be used for a new
+managed binding. Valid identities retain their exact bytes. The stored value,
+event content, rows, source cursor, and shared history are not rewritten. The
+CLI repeats the privacy projection for older-server responses.
+
+This boundary establishes identity representation and privacy only. It does not
+prove a native file exists, authenticate a source ID, correlate a run with an
+event, or establish a tool outcome. SQL refusal remains transactional; this
+change does not add an atomic disk/SQL seal or change lease/retry policy.
+
 ## Native adapter behavior
 
 | Harness | Fresh native session | Returning native session | Read-only source |
 |---|---|---|---|
 | Claude Code | generated `--session-id` | `--resume <id>` | `~/.claude/projects/**/*.jsonl` |
 | Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl` |
-| OpenCode | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only |
-| OpenCode 2 beta | native default creation | `--session <id>` | same `opencode.db` as v1 (the beta channel keeps v1's filename; the beta adds `session_v2`/`session_message` tables beside v1's); launched via the `opencode2` binary |
+| OpenCode V1 | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only; selected when the exact launch executable reports major 1 |
+| OpenCode V2 | native default creation | `--session <id>` | same `opencode.db` filename, using the `session_v2`/`session_message` tables; selected when the exact launch executable reports major 2 |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
-| Crush | native default creation | `--session <id>` | `<project>/.crush/crush.db` opened read-only |
+| Crush | native default creation | `--session <id>` | `<data dir>/crush.db` opened read-only: `options.data_directory` from Crush's JSON configs, else the closest `.crush` up to the git worktree root, else `<cwd>/.crush` |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
 | Command Code | native default creation | `--session <uuid>` | `~/.commandcode/projects/*/<uuid>.jsonl` |
 | Kiro CLI v2 | native default creation | `--resume-id <uuid>` | `$KIRO_HOME/sessions/cli/<uuid>.jsonl` (+ sibling `<uuid>.json` metadata) |
 | Kiro CLI v3 | native default creation with `--v3` | `--v3 --resume-id <sess_uuid>` | `$KIRO_HOME/sessions/<checkout-bucket>/<sess_uuid>/messages.jsonl` (+ sibling `session.json` metadata) |
-| OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
+| OMP | native default creation | `--resume=<id>` | `<agent dir>/sessions/**/*.jsonl`, or the XDG session directory described below |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
-| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
+| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata; user prompts only from `~/.gemini/antigravity-cli/history.jsonl` (assistant and tool steps come from lifecycle-hook capture) |
+
+OMP's agent directory is `~/.omp/agent` for the default profile and
+`~/.omp/profiles/<name>/agent` for a named profile. `PI_CONFIG_DIR` changes the
+`.omp` root relative to the user's home. The default profile can also use
+`PI_CODING_AGENT_DIR`. On Linux and macOS, sessions move to
+`$XDG_DATA_HOME/omp/sessions`, or `$XDG_DATA_HOME/omp/profiles/<name>/sessions`
+for a named profile, when that OMP directory exists and the agent directory
+has not been relocated.
 
 Command Code v3 transcripts are self-describing and append-only. The adapter
 requires the UUID filename, header id, and canonical header `cwd` to agree
@@ -393,12 +642,119 @@ An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session.
+
+When the linked Claude session is a Claude Code background session that is
+still running in the daemon, Claude refuses `--resume <id>` when another flag
+comes with it (seen with `--model`, `--effort` and
+`--dangerously-skip-permissions` on Claude Code 2.1.287; a bare `--resume`
+attaches) and points at `claude attach <id>`. Only when the
+transcript shows the session ran in the background (`sessionKind: "bg"`)
+does ai-memory ask `claude agents --json --cwd <checkout>`. When that lists the
+session as a live background one in this checkout, it launches
+`claude attach <id>` with the listing's short id instead. Native arguments are
+not passed to the attach client. In the Claude Code 2.1.288 lifecycle validation,
+no new `SessionStart` was observed from the attach client; the background
+worker's hooks carried the background session id. Delivery of a pending
+workstream context packet through attach remains unverified: that validation
+did not exercise a pending packet. The launcher reports this limitation and
+suppresses the missing-acknowledgement warning for attach. (#1052)
+
+When the attach client detaches or exits early, the managed run finishes with
+the client's exit status and imports the linked transcript available at finish.
+It neither stops the daemon nor waits for the background turn to complete;
+events written after that import remain outside it. In the same validation,
+Ctrl-Z detached with exit 0, and terminating only the attach client produced
+exit 1 while the daemon continued and emitted `Stop` after the run finished.
+
+A failed, unavailable or unexpected `claude agents` listing keeps the native
+resume and its original flags. That fallback can still encounter Claude's
+refusal to resume a live background session with flags. The lifecycle test
+injected an exit-127 listing and an incompatible JSON object, then exercised
+the real resume and backend; an older Claude binary without `agents` was not
+tested. These observations are recorded in the
+[PR #1067 lifecycle validation](https://github.com/akitaonrails/ai-memory/pull/1067#issuecomment-5962340148).
+
+Claude Code background sessions run inside the Claude Code daemon, separately
+from the attach client. Their hooks use the daemon worker's inherited
+environment: the 2.1.288 validation observed an `AI_MEMORY_RUN_ID` from an
+earlier launch, different from the current attach runs. A daemon hook therefore
+does not by itself identify the current attaching run. When a managed Claude
+session attaches to one (`/resume` on a session shown as
+"running in the background"), the conversation goes on in the background
+session's transcript. At the end of the run, ai-memory looks for a transcript
+written during the run whose `sessionKind: "bg"` records name the run's own
+session as the attached client and this checkout as `cwd`, and finishes the run
+on that background session, so the next launch resumes it instead of the empty
+foreground session. A background session attached by another launch is never
+taken. (#1050)
+
+Crush has no hooks to link its session: a fresh Crush launch claims the one top-level session
+created while it ran (its title and sub-agent sessions do not count), and
+imports nothing, with a warning, when another launch on the same store created
+one too; resume that session with `--session <id>` to link it. `--continue`
+claims the one session it touched on the same terms. When the data directory
+lies outside the project, as a global `data_directory` does, other projects'
+sessions share it and Crush records no directory per session, so a run claims
+only a session that edited a file in this project (its sub-agents' edits
+count), and only when it is the one; otherwise it imports nothing, with the
+same warning. The store's real location decides, so a `.crush` symlinked to a
+shared directory is shared. Another project's session that edited a file here
+still counts as this project's.
 Pi and OMP `--session-dir` values and Crush `--data-dir` values are passed
-through unchanged and used as the read-only import root. Native store
+through unchanged and used as the read-only import root. Without `--data-dir`,
+ai-memory finds Crush's data directory as Crush does, except that it does not
+run a `crushrc` to read one set only there; pass `--data-dir` in that case. Native store
 environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
 `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`,
-`KIRO_HOME`, and `GROK_HOME`.
+`KIRO_HOME`, and `GROK_HOME`, plus OMP's `PI_CONFIG_DIR`.
+OMP profile selection follows a leading `--profile`, then `OMP_PROFILE`, then
+`PI_PROFILE`. A named profile ignores `PI_CODING_AGENT_DIR`. A `--profile`
+later in the command line is left to OMP; use `OMP_PROFILE` or
+`--env OMP_PROFILE=<name>` so ai-memory can resolve the same profile.
+
+Blank directory overrides (empty or whitespace-only values) count as unset.
+Session import, hooks and MCP use their fallback paths, and `ai-memory run`
+removes those values from the child environment. Profile variables follow a
+different rule: an empty `OMP_PROFILE` selects the default profile and still
+takes precedence over `PI_PROFILE`.
+Export these in the environment `ai-memory run` itself sees, or pass them with
+`--env` (below), not only inside a harness wrapper script. `ai-memory run`
+resolves the native session directory, and auto-wires hooks and MCP, from that
+environment; if the harness writes its transcript under a custom
+`CLAUDE_CONFIG_DIR` that `ai-memory run` cannot see, the two disagree and the
+native transcript import fails. When you use per-account
+config directories, set the variable before invoking `ai-memory run` (or in the
+same wrapper that also runs it), so hook installation and native-session
+resolution agree.
+
+A repeatable `ai-memory run --env KEY=VALUE <harness>` (and `--env-file
+<path>`, one `KEY=VALUE` per line, blank lines and `#` comments skipped) is
+the first-class alternative to the `env KEY=VAL harness` wrapper-alias
+pattern above: it is a wrapper-owned flag, so it must precede the harness
+name, and the resolved environment reaches the spawned harness process,
+`ai-memory run`'s own native-session resolution, *and* first-launch auto-wire.
+Hooks, MCP and transcript import then follow the same config home, which is the
+`CLAUDE_CONFIG_DIR`-agreement requirement described above, without exporting the
+variable into the invoking shell first. A later `--env` overrides a same-key
+`--env-file` entry; neither expands nor interprets the value, so let the shell
+expand `$HOME` on the command line and write absolute paths in an
+`--env-file`. Manual `install-hooks` / `install-mcp` do not take `--env`; they
+read their own environment.
+
+Automatic harness selection (bare `run`, `continue` and `resume`) scans the
+store the launch resolves from that same environment, so a checkout whose
+sessions live under a custom `CLAUDE_CONFIG_DIR` is found when the variable is
+set. Whenever the client links a session, at launch or when the run finishes,
+it also records that session's store in the client-local `client-projects.json`.
+If a later launch cannot find the linked session in the store it resolves and
+the recorded store is a different directory, the launch stops with an error
+naming both directories instead of starting fresh and repointing the workstream
+away from a session that still exists. Relaunch with the same variable (or
+store flag) to resume it, or pass `--fresh` to start a new session. Sessions linked before this record
+existed, and a session missing from its own recorded store, still start fresh
+as before.
+
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never
@@ -426,6 +782,33 @@ adding another managed harness must follow the [managed-harness contribution
 protocol](managed-harness-contributions.md), including read-only extraction,
 pre-turn context delivery, migration invariants, deterministic tests, and an
 opt-in real-harness acceptance pass.
+
+### Codex shared-daemon recovery (#987)
+
+Recent Codex releases run sessions through a shared background app-server
+daemon (`codex agents` lists it). The daemon keeps the environment it started
+with, and the lifecycle hooks it launches inherit that environment, including
+the `AI_MEMORY_RUN_ID` of whichever managed run auto-started it. When a later
+managed Codex SessionStart reports that finished id, ai-memory ignores it as
+authority and searches only the request's already-resolved repository, exact
+checkout cwd, and operator bucket. The server adopts a replacement only when
+exactly one live, undelivered Codex run is waiting there, and it selects plus
+links that run in one writer transaction. Multiple candidates, an active id
+whose scope, checkout, or owner does not match, and a run already linked by
+another session all fail closed.
+
+Ordinary managed Codex launches therefore work with the shared daemon. For
+diagnosis, or when an intentionally concurrent pair of named workstreams makes
+recovery ambiguous, native arguments after the harness are still forwarded:
+
+```bash
+ai-memory run codex --no-daemon
+```
+
+`--no-daemon` makes that one session run without the shared background server
+even if one is already running; it is available on Codex's interactive and
+`resume` commands (checked on Codex 0.156). It remains useful for isolation,
+but normal workstream continuity does not require it.
 
 ## Installation and recovery
 
@@ -455,9 +838,10 @@ is a one-way hash of the working directory, so discovery always reads
 `state.json`'s current `cwd` field or legacy `workDir` alias and never parses
 the bucket name. Conflicting aliases or a persisted id that disagrees with the
 session directory are rejected. Event ids derive
-from the SHA-256 of the raw wire.jsonl line, so two byte-identical lines —
-only possible with identical content in the same millisecond, because Kimi
-Code stamps each record with `time` — collapse into a single ledger event.
+from the SHA-256 of the raw wire.jsonl line, so two byte-identical lines
+collapse into a single ledger event. That can only happen with identical
+content in the same millisecond, because Kimi Code stamps each record with
+`time`.
 The incremental cursor stores both the complete-record byte offset and a
 SHA-256 of that imported prefix. Normal appends resume at the saved offset;
 if Kimi rewrites `wire.jsonl` in place, ai-memory resets to the beginning and
@@ -494,7 +878,8 @@ transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
 checks the configured v3 root first and that default root as a compatibility
 fallback. If a linked session exists only in the fallback, ai-memory removes
 `KIRO_HOME` for that one resume so Kiro can find the session; Kiro consequently
-uses its default-home v3 settings/hooks for that process. Fresh launches and
+uses its default-home v3 settings/hooks for that process, and first-launch
+auto-wire wires that default home rather than `KIRO_HOME`. Fresh launches and
 versions that store the session below the configured root keep `KIRO_HOME`
 unchanged. Every candidate still needs exact id, schema, and checkout metadata.
 The v2 `--yolo` translation is `--trust-all-tools`; an explicit narrower
@@ -525,8 +910,8 @@ Antigravity keeps one SQLite database per conversation at
 file name and no scan is needed to locate one. The workspace a conversation was
 opened on comes from `trajectory_metadata_blob`, a protobuf message whose first
 field holds a nested message whose first field is the workspace `file://` URI;
-only those two fields are read. A database that does not carry them — an older
-or newer `agy` — is skipped rather than failing the listing. Note the recorded
+only those two fields are read. A database that does not carry them (from an
+older or newer `agy`) is skipped instead of failing the listing. Note the recorded
 workspace is the directory `agy` was launched from, not a checkout root, so a
 conversation started one level up is not offered inside a subdirectory.
 
@@ -543,9 +928,17 @@ Antigravity CLI v1.1.7. Antigravity is not part of the no-argument
 auto-detection set; name it explicitly.
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
-its one-time context from the server, copies the existing global Crush JSON into
-a private temporary directory, appends an ephemeral context path, and points the
-child at that directory with `CRUSH_GLOBAL_CONFIG`. Delivery is acknowledged
+its one-time context from the server, copies the global Crush JSON the launch
+would read (`$CRUSH_GLOBAL_CONFIG/crush.json`, else
+`$XDG_CONFIG_HOME/crush/crush.json`, else `~/.config/crush/crush.json`, with
+`--env` entries first and a blank value counting as unset) into a private
+temporary directory, appends an ephemeral context path, and points the child at
+that directory with `CRUSH_GLOBAL_CONFIG`. When that JSON lists no
+`global_context_paths`, the launcher first adds the `CRUSH.md` and `AGENTS.md`
+Crush would have loaded by default, so the packet does not replace them. A
+global `crushrc` next to that JSON is carried over by a generated `crushrc` in
+the temporary directory that sources it from its own directory, where Crush
+runs it. Delivery is acknowledged
 only after the child starts, so a spawn failure cannot lose the packet. The
 original config is not modified. ai-memory opens the project database read-only;
 the launched Crush process continues its normal native session writes.
@@ -553,8 +946,16 @@ the launched Crush process continues its normal native session writes.
 The Linux/macOS Docker shell wrapper cannot inspect host projects or execute a
 host agent from inside its helper container. For `run`, `show`, `continue`,
 `resume`, and `workstreams`, it downloads the matching native release into
-`~/.cache/ai-memory/native-runner`, verifies the published SHA-256 checksum, and
-executes that host client. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
+`${XDG_DATA_HOME:-~/.local/share}/ai-memory/native-runner`, verifies the
+published SHA-256 checksum, and executes that host client. The release's
+`hooks/` bundle is kept beside it so auto-wire can stage hook scripts on a host
+where `install-hooks` never ran. The client lives with the host's ai-memory data
+rather than under `~/.cache` because auto-wired hook configuration runs it
+directly: a cache flush must not break capture. A client downloaded by an older
+wrapper stays in `~/.cache/ai-memory/native-runner`, and hooks auto-wired from it
+keep that path until a newer client version auto-wires again. To move them now,
+re-run `ai-memory install-hooks --agent <agent> --apply`, then delete the old
+directory. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
 specific native build. Native package, release, and source installs need no
 shim. On native Windows, use the published `ai-memory.exe` or a source build.
 
@@ -572,9 +973,49 @@ On a normal exit, ai-memory imports the transcript and closes the lease before
 returning. Handled setup, launch, or import failures cancel the lease
 immediately. A new launch retries an active-workstream conflict briefly so a
 previous launcher can finish; if another harness is genuinely still running,
-the conflict remains and concurrent writers are still rejected. Terminal
+the conflict remains and concurrent writers are still rejected.
+
+### Lease recovery
+
+A launcher that dies without releasing its lease (killed, its terminal
+closed, or a sandbox such as ai-jail torn down) leaves the workstream held
+until that lease lapses. An interactive relaunch (stdin and stderr are
+terminals) no longer fails on that: the conflict reports the lease's expiry, so
+ai-memory says who holds it and waits for it to lapse (at most one lease,
+~90 seconds; `Ctrl+C` aborts), then starts normally. If the holder renews the
+lease while you wait, it is a launcher that is still running, and you get an
+error instead. Stop it, or pass `--new <name>` for a separate workstream. The
+server's busy check stays the only arbiter: the waiting launcher never forces
+another run off. Non-interactive launches (scripts, hooks, CI) keep the short
+retry window and fail fast rather than hanging. Terminal
 interrupts continue to reach the child while the parent stays alive to finish
 or cancel the run.
+
+When you know the prior launcher is gone and do not want to wait for the lease,
+force-expire it explicitly:
+
+```bash
+ai-memory run --force-unlock codex
+# The exact wrapper flag is also accepted after the harness name.
+ai-memory run codex --force-unlock
+```
+
+The replacement is atomic and limited to the same durable authenticated
+operator; in single-user or otherwise unattributed operation, both runs must be
+unattributed. A different operator's active run is still refused. The command
+expires the managed lease only; it does not signal or kill a native process.
+If the previous launcher is actually alive, its later heartbeats and finish are
+rejected, and its final transcript tail may not be imported. Use
+`--force-unlock` only after verifying that launcher has stopped. Older servers
+do not honor the request and return a refusal, so upgrade the server as well as
+the client before relying on this recovery path.
+
+Before the child starts, `Ctrl+C` at the native-session chooser cancels the
+acquired run and exits without requiring Enter or adopting the selected session.
+The launcher waits for the server's cancellation response. A request error is
+reported and leaves the lease to expire within its normal 90-second window;
+a server that accepts the request but never responds can still keep the launcher
+waiting. Heartbeats have stopped, so the lease itself still expires.
 
 While the harness or native-session selector is open, a temporary server outage
 produces one short notice instead of printing every failed heartbeat. The
@@ -594,6 +1035,38 @@ process launch is fatal; ai-memory does not silently start an unmanaged agent.
 
 ## Privacy and storage boundaries
 
+Finish imports, including retries of finished runs, use the identity resolved by
+HTTP authentication. A caller must own the run (or reach a shared NULL-owned
+run). Database users must hold current Write access to its actual
+workspace/project. Another writer in the same project cannot finish a run
+attributed to a different
+operator. Root without an actor reaches only shared runs; root authentication
+does not bypass ownership. Authenticated operators behind the configured trusted
+proxy retain their existing project access policy without requiring a database
+user. Actor headers without proxy authentication and transcript metadata cannot
+supply this authority. Disabling a user's human login does not revoke an active
+API key; the HTTP authentication checks the key, and finish checks that the
+database user still exists and has current project access.
+
+With authentication disabled but database users still present, anonymous finish
+requests to restricted projects are refused. Prepare retains its existing
+compatibility path and can still succeed. Completing the run requires
+authentication and a caller satisfying the ownership and Write checks above.
+
+The server checks access before reading run status or writing a raw segment,
+then checks again in the SQLite writer transaction before any import, cursor,
+link, or run update. The transaction reads current users, project mode, creator,
+and paired grants; SQL failures and malformed or missing scope fail closed.
+This stricter resolution applies only to finish imports. An active run can still
+finish after its lease timestamp has elapsed, and an authorized finished retry
+imports zero events. Cancelled or replaced runs remain expired and refused.
+
+Raw segments are written before the SQL transaction. A Write revocation after
+the preflight can leave a sanitized raw segment without an indexed event. The
+writer refusal leaves SQL unchanged; raw-file persistence and SQL are not an
+atomic operation.
+
+
 ai-memory's managed adapters do not write to Claude, Codex, OpenCode, Pi, Crush,
 Kimi Code, Command Code, Kiro, OMP, Grok, or Antigravity private stores. The
 launched harness retains normal ownership of its own session writes. Adapters read only
@@ -602,8 +1075,8 @@ content, system/developer prompt records, and hidden reasoning are not copied. T
 server sanitizer runs before both the SQLite FTS ledger and immutable files under
 `<data_dir>/raw/workstreams/<workstream-id>/segments/` are written.
 
-The ledger is an operational continuity substrate, not a replacement for the
-markdown wiki. Durable decisions, rules, procedures, and project facts still
+The ledger carries operational continuity and does not replace the markdown
+wiki. Durable decisions, rules, procedures, and project facts still
 belong in wiki pages through consolidation or explicit durable writes.
 
 ## Project and directory renames
@@ -706,28 +1179,28 @@ process, falling back to matching the agent's own screen output against
 per-agent manifests.
 
 `ai-memory run` sits awkwardly between the two. The foreground process is the
-wrapper and the agent is its child — one process group whose leader is
-`ai-memory` — so process detection does not find the agent. The pane resolves
+wrapper and the agent is its child (one process group whose leader is
+`ai-memory`), so process detection does not find the agent. The pane resolves
 only once the harness paints a title Herdr recognizes, which can be well after
 launch and may never happen for a harness whose output matches no manifest.
 Until then Herdr's agents pane shows nothing for that pane.
 
-ai-memory does not try to fix this from the inside, deliberately. Herdr's hint
+ai-memory deliberately does not try to fix this from the inside. Herdr's hint
 for wrapper commands, `HERDR_AGENT`, is scoped to the pane's foreground
-process, and a process cannot amend its own environment after exec — so the
+process, and a process cannot amend its own environment after exec, so the
 wrapper has no way to describe itself to Herdr once it is already running.
 Setting the variable on the agent it spawns would put it somewhere Herdr does
 not look for it.
 
 Two things work today.
 
-**Name the agent on the command**, where Herdr does look:
+Name the agent on the command, where Herdr does look:
 
 ```bash
 HERDR_AGENT=codex ai-memory run codex
 ```
 
-**Or install Herdr's own agent integration**, which is the better answer:
+Or install Herdr's own agent integration, which is the better option:
 
 ```bash
 herdr integration install codex
@@ -735,8 +1208,8 @@ herdr integration install claude
 ```
 
 An installed integration reports agent identity and lifecycle state over
-Herdr's socket and is authoritative regardless of process detection — so the
-wrapper stops mattering entirely. It also upgrades what Herdr can show: real
+Herdr's socket and is authoritative regardless of process detection, so the
+wrapper no longer matters. It also upgrades what Herdr can show: real
 `idle` / `working` / `blocked` signals instead of inferring from the screen,
 which cannot reliably see `blocked` at all.
 

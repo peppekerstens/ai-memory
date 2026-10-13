@@ -4,7 +4,7 @@
 > native `aim_` API credentials are the current shipped contract.
 
 ai-memory is **single-tenant wiki data** with **optional multi-user
-attribution**. Every authenticated request sees the same wiki pages —
+attribution**. Every authenticated request sees the same wiki pages;
 there is no per-page RBAC or group permission model. Operational handoffs and
 open-session recovery are owner-scoped so one operator cannot accidentally
 consume or finalize another's live context. What multi-user mode also adds is
@@ -25,7 +25,7 @@ Authenticated clients sharing one server must emit a distinct agent-run id for
 each run and forward that same id on their MCP requests when using session-aware
 auto-scope. Legacy sessions whose stored owner is `NULL` remain shared.
 
-If you run ai-memory alone, you can skip this page — your install
+If you run ai-memory alone, you can skip this page; your install
 keeps working unchanged.
 
 ## When to enable it
@@ -37,7 +37,7 @@ You probably want multi-user mode when:
 - You want the audit log to record *who* made each write (e.g. to
   trace `Codex` writes vs `Claude Code` writes vs hand-rolled CLI
   calls).
-- You're planning to use the admission webhook chain —
+- You're planning to use the admission webhook chain, because
   webhooks receive the actor identity in their payload.
 
 You probably **don't** need it when:
@@ -60,7 +60,7 @@ Every HTTP request is resolved to one of four authentication tiers:
 | **1 — Root** | Bearer matches `[auth].bearer_token`. | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
 | **1b — Proxy-asserted user** | Bearer matches the distinct `[auth].actor_proxy_bearer_token`. | Identity is taken from trusted `X-Memory-Actor-*` headers. The request is a **user** unless its OIDC issuer/subject pair exactly matches the configured root pair. Missing or malformed identity is rejected. |
 | **2 — DB user** | Bearer doesn't match root, matches an active `api_credentials.token_hash` (SHA-256 of the secret + `[auth].token_pepper`). Native keys use the `aim_` prefix. | Allowed as **that user** for normal read/write APIs. Native keys always resolve as `AuthLevel::User`, even when the owning identity is `role=root`. All `/admin/*` endpoints are root-only in multi-user mode. The audit log records the username/email/name. |
-| **3 — 401** | Bearer present but matches nothing. | Rejected. Closes the bypass — unknown bearers can't slip through as anonymous. |
+| **3 — 401** | Bearer present but matches nothing. | Rejected. This closes the bypass: unknown bearers can't slip through as anonymous. |
 
 The rungs are sticky: a request is matched at the first credential that
 applies, never escalates. Startup rejects equal root and proxy credentials;
@@ -80,20 +80,20 @@ plus a separate CSRF cookie that the SPA must send on cookie-authenticated
 
 | Endpoint | Class | Notes |
 |---|---|---|
-| `POST /auth/login` | public | Rate-limited. Returns the `/auth/me` snapshot plus `Set-Cookie`. |
+| `POST /auth/login` | public | Rate-limited; `application/json` body only (415 otherwise). Returns the `/auth/me` snapshot plus `Set-Cookie`. |
 | `GET /auth/me` | session | Identity, `role`, `must_change_password`, capabilities. Anonymous only in zero-config loopback. |
 | `POST /auth/password` | session + CSRF | Changes password, revokes other sessions, rotates this one. |
 | `POST /auth/logout` | session + CSRF | Revokes the session and expires cookies. |
-| `POST /auth/recovery` | public | Break-glass for the configured `root_username`. Never issues a session. |
+| `POST /auth/recovery` | public | Break-glass for the configured `root_username`; `application/json` body only (415 otherwise). Never issues a session. |
 
 Passwords are Argon2id PHC strings, 12–1024 UTF-8 bytes, hashed off the writer
 actor. The last enabled root with a password cannot be disabled or demoted.
 
 Greenfield bootstrap consumes `AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD` once
-(`human_auth_state.bootstrap_completed`). Later restarts ignore it — unset the
+(`human_auth_state.bootstrap_completed`). Later restarts ignore it, so unset the
 env var. Lost root uses `AI_MEMORY_AUTH__RECOVERY_TOKEN` (at least 32
 characters), compared constant-time and never stored in SQLite. Public
-recovery failures — wrong token, recovery unset, or password policy —
+recovery failures (wrong token, recovery unset, or password policy)
 share one 401 `{"error":"invalid credentials"}` body. `Config::load()`
 rejects equality among the initial password, recovery token, root bearer,
 and actor-proxy bearer without logging the values. Operator runbook:
@@ -101,8 +101,11 @@ and actor-proxy bearer without logging the values. Operator runbook:
 
 `/admin/*` and `/api/v1/*` accept a machine Bearer **or** a web session.
 Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
-behind auth. Once human auth becomes active, the engine expires the deprecated
-`ai_memory_auth` compatibility cookie.
+behind auth. With human auth active and no session, a browser GET to the
+builtin wiki redirects to `{web_slug}/login` (HTML form → `POST /auth/login`);
+`must_change_password` redirects to `{web_slug}/change-password`. JSON clients
+and `/api/v1` still receive JSON 401/403. Once human auth becomes active, the
+engine expires the deprecated `ai_memory_auth` compatibility cookie.
 
 ## Trusted proxy identity
 
@@ -136,8 +139,8 @@ root_subject = "<root-subject>"
   send a Secure cookie.
 - **The proxy MUST strip client-supplied `X-Memory-Actor-*` headers before
   setting its own.** Use a directive that *replaces* the header rather than
-  appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`) —
-  with an appending ingress the client's value arrives first and would be the
+  appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`).
+  With an appending ingress the client's value arrives first and would be the
   one read. Repeated headers and comma-folded values are rejected with `400`
   rather than resolved to one identity.
 - Every proxy request must assert `X-Memory-Actor-User`, or both
@@ -150,6 +153,17 @@ root_subject = "<root-subject>"
   exact match with `root_issuer` plus `root_subject`.
 - Origin health checks or maintenance calls that need root should use the root
   bearer, not the proxy bearer. Raw actor headers on the root rung are ignored.
+- **A proxied non-root end-user is not subject to per-project `restricted`
+  grants.** The proxy branch authenticates the request as `AuthLevel::User`
+  with an `ActorContext`, but, unlike a database user, never maps it to a
+  database `UserId`/`AuthorizedViewer`: grants are keyed on `UserId`, and a
+  proxied identity has none to key on. A missing `AuthorizedViewer` reads as
+  "no per-project check applies" (the same as root, or an install with no
+  database users at all), so a `restricted` project is readable by any
+  proxied user with no grant. This is by design, not a gap: in a trusted-proxy
+  deployment the proxy itself is the authorization boundary. If you need
+  per-project `restricted` enforcement for individual end users, issue them
+  database-user tokens (see above) instead of relying on the proxy headers.
 
 ## Identity keys
 
@@ -170,7 +184,7 @@ username-only assertion to the OIDC pair deliberately changes it once.
 Handoffs and sessions record the operator they belong to (`owner_user` /
 `actor_user`, holding the qualified `IdentityKey::storage_key()` TEXT). On a
 shared server this stops one operator's pending handoff from being delivered
-to — and consumed by — the next session to start, whoever it belongs to.
+to, and consumed by, the next session to start, whoever it belongs to.
 
 - A `NULL` owner means **shared with the project**: every row written before
   ownership existed, and anything written without an authenticated actor, stays
@@ -179,13 +193,13 @@ to — and consumed by — the next session to start, whoever it belongs to.
   Single-operator servers are unaffected even when they name their operator via
   `[auth].root_username`: with no `users` rows and no proxy bearer there is
   nobody to separate, and stamping the one name would separate that operator's
-  *transports* instead — HTTP requests carry the name, while the stdio /
+  *transports* instead: HTTP requests carry the name, while the stdio /
   in-process MCP transport and the local CLI carry no actor at all and would
   stop seeing what the HTTP side wrote. Reads are deliberately **not** gated the
   same way, so a row stamped while the deployment did distinguish operators
   stays readable by that operator afterwards.
-- The owner is the qualified identity the request names —
-  `ActorContext::identity_key()`, so the issuer-qualified OIDC key when a
+- The owner is the qualified identity the request names, as returned by
+  `ActorContext::identity_key()`: the issuer-qualified OIDC key when a
   complete issuer/subject pair is asserted and `user:<name>` otherwise. It is
   the same rule that decides the auth tier, so the proxy path gets real
   per-operator isolation rather than one shared bucket.
@@ -209,7 +223,7 @@ to — and consumed by — the next session to start, whoever it belongs to.
   deployment distinguishes operators.
 - The read-only handoff listing (`GET
   /api/v1/workspaces/{ws}/projects/{p}/handoffs`) serves its prompt-derived
-  fields — `summary`, `open_questions`, `next_steps` — to a caller the server
+  fields (`summary`, `open_questions`, `next_steps`) to a caller the server
   can name (their own rows plus the shared ones) and to the root operator, who
   reads every page body through the wiki API anyway. A caller an authenticating
   server can place as neither gets the metadata with `redacted: true`. A server
@@ -218,16 +232,16 @@ to — and consumed by — the next session to start, whoever it belongs to.
   the explicit recovery view with `?all_owners=true`, while user and anonymous
   tiers receive `403`.
 - Handoff lifecycle events raise admission ops (`handoff_begin`,
-  `handoff_accept`, `handoff_cancel`), so an admission webhook can observe or —
-  with `failure_policy = "reject"` — refuse them. Only reject-policy hooks are
+  `handoff_accept`, `handoff_cancel`), so an admission webhook can observe them or,
+  with `failure_policy = "reject"`, refuse them. Only reject-policy hooks are
   awaited on these ops; observers are notified after the operation is durable.
 
 "Multi-user mode" here means *the deployment distinguishes operators*: either
 `users` rows exist, or `[auth].actor_proxy_bearer_token` is configured. A trusted
 proxy never writes a `users` row, so counting only rows would leave every
 proxied caller on the single-operator escape hatch that waves admin through.
-One question, every gate: the MCP admin tools, the `/admin/*` route layer, and
-the ownership stamped on handoffs and sessions all ask it.
+The MCP admin tools, the `/admin/*` route layer, and
+the ownership stamped on handoffs and sessions all ask this same question.
 
 ## MCP client activity
 
@@ -264,20 +278,20 @@ written before this is unnamespaced, therefore shared.
 ON:
 
 - session briefs and consolidation prompts show you the shared slots plus your
-  own — including the pointer list of recently touched pages, so another
+  own, including the pointer list of recently touched pages, so another
   operator's slot path and title stay out of your brief too;
 - the engine namespaces the slots it writes: a consolidation run that targets
   the shared slot lands in the session operator's own namespace instead, and a
   path the model aims at somebody else's namespace is skipped rather than
-  written or re-homed — that path comes from the model, and
+  written or re-homed, because that path comes from the model, and
   anything reaching your observations can dictate it;
 - a `memory_write_page` call naming the SHARED slot is namespaced into your
   own prefix, exactly as the engine would (the response reports the path the
   page actually got), and writing into another operator's namespace is refused
   (admins may still curate any namespace, the shared slot included).
 
-With it OFF a nested slot path means nothing in particular — every slot goes
-into every brief, exactly as before the feature existed — so turning it back
+With it OFF a nested slot path means nothing in particular: every slot goes
+into every brief, exactly as before the feature existed, so turning it back
 off makes personal slots visible to everyone again rather than stranding them.
 
 The `<segment>` is derived from the qualified identity on this server: a short,
@@ -310,17 +324,17 @@ writes pages at paths the model picks from the repository's own README, docs
 and code, with no operator to attribute them to, so a repo carrying injected
 instructions can make it write a `_slots/…` page. It is an admin-only
 operation on a repository the admin chose to ingest, and the behaviour is the
-same with the flag off; review `bootstrap.md` — it lists every path written.
+same with the flag off; review `bootstrap.md`, which lists every path written.
 
 ## Other per-operator state
 
 Beyond attribution, some engine state is recorded per operator. "Absent means
-shared" is the rule throughout — a row with no recorded operator behaves
-exactly as it did before the column existed — so a single-operator server
+shared" is the rule throughout. A row with no recorded operator behaves
+exactly as it did before the column existed, so a single-operator server
 keeps its historical behaviour:
 
 - **Auto-improvement proposals.** Each records the operator who staged it (the
-  qualified identity key — username or complete OIDC issuer/subject pair — so
+  qualified identity key, meaning username or complete OIDC issuer/subject pair, so
   proxy-asserted humans count too, and it shows up on the proposal detail),
   and the "one
   pending proposal per page" rule applies per operator, so operators stop
@@ -332,7 +346,7 @@ keeps its historical behaviour:
   any named operator's pending proposal for the same page.
 
   A proposal that does collide with one already pending is skipped on its own
-  — the run's other proposals still stage — and every staging surface reports
+  (the run's other proposals still stage), and every staging surface reports
   the skip with the target path and the reason (the `skipped` list in the MCP
   and `/admin` responses, the CLI output, and the scheduler's log), so a run
   of N-1 proposals is never silently indistinguishable from a clean run of
@@ -341,7 +355,7 @@ keeps its historical behaviour:
   operator is recorded per page alongside the existing shared access counter.
   `[decay] breadth_weight` (default `0.0`) optionally lets a
   page reinforced by many different people outrank one read repeatedly by a
-  single person — the forget sweep reads the per-page count of distinct
+  single person: the forget sweep reads the per-page count of distinct
   operators and feeds it into the retention score. At the default, and for
   pages with fewer than two distinct readers at any weight, retention scores
   are unchanged.
@@ -385,7 +399,7 @@ root_name     = "Boss"             # optional, surfaced in UIs
 ```
 
 `token_pepper` was auto-generated by `ai-memory init`; **do not
-change it after issuing native API keys** — rotating the pepper invalidates
+change it after issuing native API keys**, because rotating the pepper invalidates
 every `aim_` credential. The pepper makes copied
 `api_credentials.token_hash` rows useless to an offline attacker; human
 passwords and sessions do not use it.
@@ -443,7 +457,7 @@ secrets.
 
 `ai-memory user disable <username>` stamps `disabled_at` and revokes web
 sessions. Historical `author_id` references keep resolving. Native API
-credentials stay valid — revoke those separately with `api-key revoke`.
+credentials stay valid; revoke those separately with `api-key revoke`.
 
 ```console
 $ ai-memory user disable alice
@@ -475,7 +489,7 @@ $ ai-memory api-key revoke <id>
 
 Rotation 401s the previous plaintext immediately. A revoked secret does
 not come back; issue a new key instead. Native keys authenticate as
-`AuthLevel::User` even when attached to a `role=root` identity —
+`AuthLevel::User` even when attached to a `role=root` identity;
 root automation still uses `[auth].bearer_token`. External `amk_` keys
 stay in `mcp-auth`; they are not listed here.
 
@@ -489,16 +503,20 @@ the data dir, both `0600` (the data dir itself is `0700`):
 | `<data_dir>/auth-token` | the native `ai-memory hook` command |
 | `<data_dir>/auth-header` | the shell hooks, via `curl -H @<file>` |
 
+`ai-memory uninstall` deletes both files when it removes the hooks (a full
+uninstall or `--only hooks`); `--only mcp`, `--only instructions` and `--only
+skills` keep them for the hooks still installed.
+
 It is deliberately **not** written into the agent's own config any more. Before
-#552 it went onto the hook's command line — `--auth-token <token>` for native
-hooks, an `AI_MEMORY_AUTH_TOKEN=` shell prefix for the script hooks — which put
+#552 it went onto the hook's command line (`--auth-token <token>` for native
+hooks, an `AI_MEMORY_AUTH_TOKEN=` shell prefix for the script hooks), which put
 it in the agent's config file *and* in `/proc/<pid>/cmdline` for the lifetime of
 every hook and every `curl`, readable by any local user, on every tool call.
 The second file exists for exactly that reason: building the header inline
 would put the credential straight back on a command line.
 
 An explicit `--auth-token` on a hook command, or `AI_MEMORY_AUTH_TOKEN` in the
-environment, still takes precedence — so configs written before this keep
+environment, still takes precedence, so configs written before this keep
 working unchanged. Re-run `install-hooks --apply` to move an existing install
 onto the stored form.
 
@@ -510,7 +528,7 @@ therefore strands every spooled event captured under the old one: each is
 rejected with `401` on the next drain.
 
 Since #542 the drain recovers them. Re-run `install-hooks --apply` with the new
-token, and the next drain retries any `401`ed entry with the current bearer —
+token, and the next drain retries any `401`ed entry with the current bearer;
 the hook that spawns the drain hands it down in the child's environment. The
 retry is bounded: it only runs for an entry the server has already rejected,
 only for a static bearer (an OIDC token is re-resolved and refreshed every pass
@@ -518,7 +536,7 @@ anyway), and only when the current token actually differs from the one that
 just failed.
 
 Until you re-run `install-hooks`, the hooks still hold the old token and there
-is nothing newer to retry with — those events stay queued and age out on the
+is nothing newer to retry with, so those events stay queued and age out on the
 normal retry budget rather than blocking the rest of the spool (#493).
 
 ## Running for a team
@@ -528,18 +546,18 @@ other half is *which project* it lands in, and it matters most once more than
 one person shares a server.
 
 **Knowledge is shared; batons are owned.** A page written in a project is
-readable by every operator in that project — `pages.author_id` records who
+readable by every operator in that project; `pages.author_id` records who
 wrote it and is never a read filter. That is the point of a shared server: what
 one person learns, the next person retrieves. Handoffs are the opposite: a
 handoff carries an owner, and only that operator receives it.
 
 **Concurrent edits supersede rather than collide.** Two people editing the same
 page produce a version chain, not a conflict; the later write becomes latest and
-the earlier one stays reachable. There is no merge, and none is claimed — but
-nothing is destroyed either.
+the earlier one stays reachable. There is no merge, and none is claimed,
+but nothing is destroyed either.
 
 **Isolation of the "current project" pointer is automatic** since v1.39. Unscoped
-calls (the normal case — the MCP tools default to the current project) resolve
+calls (the normal case, since the MCP tools default to the current project) resolve
 through a pointer keyed by the caller's identity and session, so two operators,
 or one operator with two harnesses, do not overwrite each other. Confirm what a
 server is running with the startup line:
@@ -587,7 +605,7 @@ finds. To populate `token_pepper` without losing your current
 config:
 
 1. **Back up the existing config** (`cp config.toml config.toml.bak`).
-2. **Generate a pepper**: `ai-memory generate-auth-token 32` — this
+2. **Generate a pepper**: `ai-memory generate-auth-token 32`. This
    prints a hex string of the same shape `init` would have
    generated.
 3. **Add the `[auth]` block** to your `config.toml`:
@@ -604,7 +622,7 @@ config:
 4. Restart `ai-memory serve`. The new fields are picked up; existing
    behaviour is unchanged.
 
-You can defer steps 3-4 indefinitely — `bearer_token` alone keeps
+You can defer steps 3-4 indefinitely; `bearer_token` alone keeps
 working as it always has.
 
 ## How credentials are stored
@@ -673,30 +691,80 @@ actual token wired into the hook env block is whatever you pass via
 server will resolve to bob at runtime. The flag is there to keep the
 operator honest, not to enforce.
 
-Without `--as-user`, hooks install the same way they always have —
-the bearer authenticates, attribution flows from the token's owner
+Without `--as-user`, hooks install the same way they always have:
+the bearer authenticates and attribution flows from the token's owner
 (root user or DB user) at write time.
+
+## Per-project access
+
+Authentication says *who* is asking; each project's **access mode** decides
+what they may reach (#708):
+
+| Mode | Who reaches the project |
+|---|---|
+| `open` (default) | Every authenticated user, which is what every project was before access modes existed. |
+| `restricted` | The root operator, the user who created it, and users holding a grant on it. |
+
+Every existing project is `open` after upgrading, so nothing changes until an
+operator restricts one:
+
+```sh
+ai-memory project access --workspace acme --project checkout-api --mode restricted
+ai-memory user grant --user alice --workspace acme --project checkout-api --level write
+```
+
+Both are root-only. Restricting prints the users who have written to the
+project, hold no grant and did not create it (the people it now refuses), so you can grant the
+ones who should keep access; nothing is granted automatically.
+
+- **Grants** are `read` or `write`, per project; `write` includes `read`.
+  There is no per-project administrator: granting, revoking and restricting
+  are the root operator's, like every other administrative act.
+  `ai-memory user grant | revoke` manages them; `ai-memory user grants
+  [--user NAME]` and `ai-memory project grants --workspace W --project P` list
+  them (REST: `POST /admin/users/{name}/grant|revoke`,
+  `GET /admin/users/{name}/grants`, `GET /admin/projects/grants`). A user holds one level
+  per project; revoking deletes the grant, and purging a project or deleting
+  its workspace takes its grants with it. Every grant, level change and revoke
+  is recorded in the audit log (`grant_access` / `revoke_access`, with who did
+  it), so "who could reach this, and since when" stays answerable.
+- **Cross-project messages** respect access too: delivering into a restricted
+  project's inbox needs `write` on it (otherwise the mailbox would be a way
+  around its grants), and so do popping its inbox and cancelling its outbox,
+  which change its queues. Listing them needs `read`.
+- **Whoever creates a project** is recorded as its creator
+  (`projects.created_by`) and keeps full access if it is later restricted,
+  without holding a grant. Projects created before this existed, or by the
+  root token, have no recorded creator.
+- **New projects** are `open` unless `[auth] new_projects_restricted = true`
+  (`AI_MEMORY_AUTH__NEW_PROJECTS_RESTRICTED=true`), which makes every project created from then on start `restricted`. The
+  reserved `scratch` project and the global preferences scope always start
+  open, and the global scope can never be restricted: it is shared by
+  construction.
+- **Writing the global preferences scope** (`scope: "global"`, or
+  `default/_global` by name) needs root or an explicit `write` grant on it,
+  because its pages reach every user's queries. Reading it stays open, and
+  having created it first grants nothing. To let a user maintain team-wide
+  preferences: `ai-memory user grant --user alice --project _global --level
+  write` (the scope must already exist; root creates it with its first write).
+- **The cross-project profile** (`docs/cross-project-profile.md`) is off on a
+  multi-user server until `[profile] enabled = true`. Then each user gets a
+  private profile in a `restricted` project named `_profile.<user id>`, which
+  only they (and root) can read or write; with `share = "workspace"` a
+  workspace's `_profile` is shared and write-gated exactly like the global
+  scope above.
+- **Gates entry, never rows.** Access decides which projects a user reaches;
+  inside a project pages stay shared exactly as before (see below).
+- **Refusals are explicit.** A user outside a restricted project gets a 403
+  naming it and the level needed, never an empty result; search, listings and the graph leave it
+  out rather than hinting at it. A hook capture into a project the user may
+  not write is dropped and counted (`dropped_unauthorized` in status), not
+  retried.
+- **No database users, no checks.** A single-operator install, and the root
+  bearer token, are never subject to access modes.
 
 ## Limitations
 
-- **Accounts are not a tenancy boundary.** Authentication tells the server
-  *who* is asking; nothing decides *what* they may read. Every authenticated
-  user sees every page in every project in **every workspace on the server** —
-  not just the one they are working in. A server holds many workspaces
-  (`projects.workspace_id` references `workspaces(id)`), but `users` carries no
-  workspace, project or repository reference and there is no grant, ACL or
-  membership table anywhere in the schema, so there is nothing for a read to be
-  checked against. Two accounts created minutes apart, sharing nothing but the
-  server, can each read the other's projects in full — including via
-  `memory_query`, which searches across scopes. All `/admin/*` endpoints are
-  still root-only in multi-user mode.
-
-  This is working as designed for the single-operator and homelab cases
-  ai-memory targets today. **If one server would hold work for more than one
-  team, that is not a supported configuration yet.** Run separate ai-memory
-  servers (per-user data dirs) behind a reverse proxy instead. Per-project
-  authorization is tracked in
-  [#708](https://github.com/akitaonrails/ai-memory/issues/708).
 
 - **No per-page RBAC *within* a project.** This one is deliberate and separate
   from the above: pages are shared inside a project because multi-session and
@@ -719,8 +787,7 @@ the bearer authenticates, attribution flows from the token's owner
   bearer / native `aim_` keys / web sessions, and `/admin/*` stays root-only unless a gateway
   translates accepted OIDC auth into upstream auth that ai-memory accepts.
   ai-memory still has one shared wiki per server and no
-  per-page RBAC — and, per the first bullet above, no per-project
-  authorization either: an accepted OIDC identity can read every project on
-  the server. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
+  per-page RBAC. Per-project access applies to the database user a gateway
+  authenticates as, like any other. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
   session id; session auto-scope needs the lifecycle-hook session id or explicit
   `workspace` + `project` / `scopes`.

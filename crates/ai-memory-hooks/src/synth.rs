@@ -10,11 +10,12 @@ use std::collections::BTreeMap;
 
 use ai_memory_core::{
     AgentKind, NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier,
-    WorkspaceId, looks_like_scaffolding,
+    WorkspaceId, looks_like_markup_block, looks_like_scaffolding, truncate_for_title,
 };
 use jiff::tz::TimeZone;
 
-use crate::payload::{is_safe_tool_title, truncate_for_title};
+use crate::capture_policy::ToolFamily;
+use crate::payload::is_safe_tool_title;
 
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
@@ -130,10 +131,20 @@ fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
         return format!("Session {session_id}");
     }
     for obs in observations {
-        if obs.kind == ObservationKind::SessionStart {
+        // The router titles an untitled lifecycle event with its kind name
+        // (`stop`, `session-end`): a string every such page would share, and
+        // what this loop reached once tool-family labels were skipped (#895).
+        if obs.kind == ObservationKind::SessionStart || obs.title == obs.kind.as_str() {
             continue;
         }
-        if !obs.title.is_empty() && !looks_like_title_scaffolding(&obs.title) {
+        // A `tool <family>` label is a partition of the calls, not a title:
+        // `looks_like_scaffolding` does not catch it, so reject it here or a
+        // session whose only non-prompt observation is a closed-tool call
+        // ("tool non-file") would take the label as its page title.
+        if !obs.title.is_empty()
+            && !looks_like_title_scaffolding(&obs.title)
+            && !is_safe_tool_title(&obs.title)
+        {
             return obs.title.clone();
         }
     }
@@ -342,6 +353,10 @@ fn render_body(
     }
     buf.push_str(&format!("- **observations:** {}\n\n", observations.len()));
 
+    if let Some(note) = abrupt_ending_note(observations) {
+        buf.push_str(&format!("{note}\n\n"));
+    }
+
     if !prompts.is_empty() {
         buf.push_str("## Prompts\n\n");
         for (i, p) in prompts.iter().enumerate() {
@@ -363,6 +378,66 @@ fn render_body(
 
     buf.push_str("\n_Synthesised by ai-memory (M3, no-LLM heuristic)._\n");
     buf
+}
+
+/// One deterministic line flagging an abrupt ending, or `None` when the
+/// session closed normally (a Stop and a SessionEnd are both on record).
+///
+/// Mirrors the multi-signal heuristics the router's `derive_open_questions`
+/// uses for automatic SessionEnd handoffs, first match wins, so the
+/// zero-LLM page states the same terminal state a handoff would flag
+/// (#1221):
+/// 1. The final substantive prompt is an unanswered question and no Stop
+///    ever arrived after it.
+/// 2. The last completed tool call touched files and no Stop followed —
+///    the session ended while working in the tree.
+/// 3. A Stop was recorded but no SessionEnd — a mid-task exit (or a
+///    checkpoint page rendered while the session is still running; the
+///    wording only claims what the log shows).
+fn abrupt_ending_note(observations: &[Observation]) -> Option<&'static str> {
+    let last_of_kind = |kind: ObservationKind| observations.iter().rev().find(|o| o.kind == kind);
+    let last_stop = last_of_kind(ObservationKind::Stop);
+    let has_session_end = observations
+        .iter()
+        .any(|o| o.kind == ObservationKind::SessionEnd);
+    // Harness blocks delivered as a user turn are not the user's question.
+    let last_prompt = observations.iter().rev().find(|o| {
+        let text = if o.body.is_empty() { &o.title } else { &o.body };
+        o.kind == ObservationKind::UserPrompt && !looks_like_markup_block(text)
+    });
+
+    if last_stop.is_none()
+        && let Some(prompt) = last_prompt
+    {
+        let text = if prompt.body.is_empty() {
+            prompt.title.trim()
+        } else {
+            prompt.body.trim()
+        };
+        if text.ends_with('?') || text.ends_with('？') {
+            return Some(
+                "Session ended without a normal stop; the final prompt was never answered.",
+            );
+        }
+    }
+
+    if last_stop.is_none()
+        && let Some(tool) = last_of_kind(ObservationKind::PostToolUse)
+        && crate::payload::tool_family_from_title(&tool.title) == Some(ToolFamily::File)
+    {
+        return Some(
+            "Session ended without a normal stop while working with files; \
+             the working tree may hold uncommitted or unverified changes.",
+        );
+    }
+
+    if last_stop.is_some() && !has_session_end {
+        return Some(
+            "A stop was recorded but no session end; the session may have exited mid-task.",
+        );
+    }
+
+    None
 }
 
 fn render_raw_observations(buf: &mut String, observations: &[Observation]) {
@@ -749,15 +824,50 @@ mod tests {
     /// loop reached the `SessionStart` and the harness's model id became the
     /// page title. The prompt was never scaffolding — it was absent, which is
     /// why no filter on the string could have caught this.
+    ///
+    /// A `tool <family>` label (`safe_tool_title`) is not a title either: it
+    /// is a partition of the calls, so the fallback loop must skip it and fall
+    /// through to the session's own identity, never surface "tool non-file" as
+    /// the page title (#895).
+    /// The shape a real SessionEnd synthesises from: the router stores the
+    /// kind name as the title of a lifecycle event that carries none
+    /// (`title_hint.unwrap_or(kind)`), so once the tool labels are skipped the
+    /// fallback reached `stop`, or `session-end` when no Stop was captured.
+    #[test]
+    fn a_labels_only_session_does_not_fall_through_to_a_lifecycle_literal() {
+        let sid = test_session_id();
+        let with_stop = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, ""),
+            obs(ObservationKind::PreToolUse, "tool non-file"),
+            obs(ObservationKind::PostToolUse, "tool non-file"),
+            obs(ObservationKind::Stop, ObservationKind::Stop.as_str()),
+            obs(
+                ObservationKind::SessionEnd,
+                ObservationKind::SessionEnd.as_str(),
+            ),
+        ];
+        assert_eq!(derive_title(&with_stop, sid), format!("Session {sid}"));
+        let without_stop: Vec<_> = with_stop
+            .into_iter()
+            .filter(|o| o.kind != ObservationKind::Stop)
+            .collect();
+        assert_eq!(derive_title(&without_stop, sid), format!("Session {sid}"));
+    }
+
     #[test]
     fn a_model_id_on_session_start_never_becomes_the_title() {
         let sid = test_session_id();
-        let with_a_later_title = vec![
+        let with_only_a_tool_family_label = vec![
             obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
             obs(ObservationKind::UserPrompt, ""),
             obs(ObservationKind::PostToolUse, "tool non-file"),
         ];
-        assert_eq!(derive_title(&with_a_later_title, sid), "tool non-file");
+        assert_eq!(
+            derive_title(&with_only_a_tool_family_label, sid),
+            format!("Session {sid}"),
+            "a tool-family label is not a page title"
+        );
 
         let nothing_else = vec![
             obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
@@ -913,6 +1023,110 @@ mod tests {
         );
 
         assert!(page.body.contains("`other [fstech:lead.contact]`"));
+    }
+
+    /// #1221: the zero-LLM page must say when a session ended abruptly,
+    /// reusing the `derive_open_questions` heuristics. A final prompt that
+    /// is a question, with no Stop after it, means the prompt was never
+    /// answered.
+    #[test]
+    fn an_unanswered_final_prompt_flags_the_abrupt_ending() {
+        let observations = vec![
+            obs(ObservationKind::SessionStart, "session"),
+            obs(ObservationKind::UserPrompt, "why is the cache empty?"),
+            obs(ObservationKind::PostToolUse, "tool non-file"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::Codex,
+            &observations,
+        );
+        assert!(
+            page.body.contains(
+                "Session ended without a normal stop; the final prompt was never answered."
+            ),
+            "the abrupt-ending line must be in the body: {}",
+            page.body
+        );
+    }
+
+    /// File activity with no subsequent Stop: the session ended while
+    /// working in the tree, so the page must say the changes may be
+    /// unverified.
+    #[test]
+    fn file_activity_without_a_stop_flags_the_abrupt_ending() {
+        let observations = vec![
+            obs(ObservationKind::SessionStart, "session"),
+            obs(ObservationKind::UserPrompt, "rework the retry loop"),
+            obs(ObservationKind::PostToolUse, "tool file"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::Codex,
+            &observations,
+        );
+        assert!(
+            page.body
+                .contains("Session ended without a normal stop while working with files"),
+            "the file-activity line must be in the body: {}",
+            page.body
+        );
+    }
+
+    /// A Stop with no SessionEnd is a mid-task exit.
+    #[test]
+    fn a_stop_without_session_end_flags_the_mid_task_exit() {
+        let observations = vec![
+            obs(ObservationKind::SessionStart, "session"),
+            obs(ObservationKind::UserPrompt, "rework the retry loop"),
+            obs(ObservationKind::Stop, "stop"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::Codex,
+            &observations,
+        );
+        assert!(
+            page.body.contains("may have exited mid-task"),
+            "the mid-task line must be in the body: {}",
+            page.body
+        );
+    }
+
+    /// Control: a clean SessionStart → prompt → tool → Stop → SessionEnd
+    /// session gets no terminal-state line at all.
+    #[test]
+    fn a_cleanly_closed_session_has_no_abrupt_ending_line() {
+        let observations = vec![
+            obs(ObservationKind::SessionStart, "session"),
+            obs(ObservationKind::UserPrompt, "rework the retry loop"),
+            obs(ObservationKind::PostToolUse, "Edit"),
+            obs(ObservationKind::Stop, "stop"),
+            obs(ObservationKind::SessionEnd, "session-end"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::Codex,
+            &observations,
+        );
+        assert!(
+            !page.body.contains("Session ended without a normal stop"),
+            "a normal close must not be flagged: {}",
+            page.body
+        );
+        assert!(
+            !page.body.contains("may have exited mid-task"),
+            "a normal close must not be flagged: {}",
+            page.body
+        );
     }
 
     #[test]

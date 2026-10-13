@@ -2,6 +2,7 @@
 
 use ai_memory_core::MemoryError;
 use ai_memory_store::StoreError;
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Result alias used throughout the wiki crate.
@@ -14,6 +15,15 @@ pub enum WikiError {
     /// Filesystem I/O failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// A wiki filesystem path crossed a symbolic-link or reparse-point boundary.
+    #[error("wiki path confinement refused {path}: {reason}")]
+    Confinement {
+        /// Path that failed confinement.
+        path: PathBuf,
+        /// Stable classification of the refusal.
+        reason: &'static str,
+    },
 
     /// Atomic-write tempfile crate error.
     #[error(transparent)]
@@ -60,10 +70,35 @@ pub enum WikiError {
     /// `409 Conflict` at the admin layer.
     #[error("destination page file already exists: {0}")]
     DestinationPageExists(String),
+
+    /// libgit2 refused a wiki-repository operation because the repository is
+    /// not owned by the account this process runs as (`code=Owner`, the
+    /// CVE-2022-24765 dubious-ownership guard). Kept distinct from a generic
+    /// I/O error so startup can surface it at ERROR with a fix: on a Windows
+    /// LocalSystem service over a user-owned data dir every wiki commit fails
+    /// this check, and it was previously logged WARN-only so nothing surfaced.
+    /// The owner check is deliberately left enabled (disabling it is
+    /// `unsafe` and reopens the CVE); the remedy is to run the service as the
+    /// owning user.
+    #[error(
+        "wiki git repository is not owned by the current account \
+         (libgit2 owner check, code=Owner): {0}"
+    )]
+    GitOwner(String),
 }
 
-impl From<serde_yaml::Error> for WikiError {
-    fn from(value: serde_yaml::Error) -> Self {
+pub(crate) fn into_io_error(error: WikiError) -> std::io::Error {
+    match error {
+        WikiError::Io(error) => error,
+        error @ WikiError::Confinement { .. } => {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+        }
+        error => std::io::Error::other(error.to_string()),
+    }
+}
+
+impl From<serde_saphyr::SerializeError> for WikiError {
+    fn from(value: serde_saphyr::SerializeError) -> Self {
         Self::Yaml(value.to_string())
     }
 }

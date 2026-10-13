@@ -53,7 +53,8 @@ cargo deny check                    # dependency policy
 ```
 
 `cargo tf` needs nextest (`cargo install cargo-nextest --locked`); without it,
-`cargo test --workspace --all-targets` is the equivalent and is what CI runs.
+`cargo test --workspace --all-targets` is the equivalent. Linux and macOS CI run the
+same tests with `cargo nextest run --workspace --all-targets --profile ci`.
 If `cargo-deny` or `cargo-audit` are not installed:
 
 ```bash
@@ -77,9 +78,26 @@ Skipped tests still count as "skipped" in the summary, never hidden, and two
 independent things run them anyway: the pre-push hook and CI.
 
 Install the hook once per clone with `scripts/install-git-hooks.sh` (from Git
-Bash on Windows). It appends or updates only ai-memory's managed block in
-`.git/hooks/pre-push`, preserving any existing hook body. Bypass it on a
-work-in-progress branch with `git push --no-verify`.
+Bash on Windows). It can run from the main checkout or a linked worktree;
+both use the shared repository hook directory. Reinstallation replaces
+ai-memory's managed block in place, preserving surrounding user commands and
+their order. If `core.hooksPath` is set, the installer stops before writing;
+integrate the block through your existing hook manager instead. Incomplete or
+duplicate managed markers also stop installation and leave the hook unchanged.
+Bypass it on a work-in-progress branch with `git push --no-verify`.
+
+The managed test block clears Git's repository environment and disables global
+and system Git configuration for Cargo and its children. Fixture commands can
+then use their own repositories without inheriting the checkout being pushed.
+The publishing Git process and other hook code retain their configuration, and
+the block's shell options stay inside it; a failing test run still fails the
+hook even when your own commands follow the block without `set -e`.
+Run the installer again to update an existing installation.
+
+Companions have separate Cargo workspaces. Check each changed companion with
+`cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`, passing
+its `--manifest-path`. Changes to the lifecycle relay also need the real-server
+test documented in [its README](companions/ai-memory-relay/README.md#validation).
 
 Integration tests live in `tests/suite/` per crate and compile into the
 crate's own test harness (declare a new file with `mod name;` in
@@ -96,15 +114,15 @@ subcommand, env var, HTTP/admin endpoint, MCP tool or tool-response field,
 observable bug fix. Internal refactors, dead-code removal, and test-only
 churn are exempt.
 
-This has been the single most-forgotten obligation across review batches,
-so reviewers treat a missing entry as **blocking** — the PR template has a
+This has been the most often forgotten obligation across review batches,
+so reviewers treat a missing entry as **blocking**, and the PR template has a
 checkbox for it. Follow the existing entry style (past-tense summary,
 trailing `([#NNN])` PR/issue reference) and place it under the right
 `### Added` / `### Changed` / `### Fixed` heading.
 
 ## Workflow rules (condensed from AGENTS.md)
 
-The full authoritative rules are in [`AGENTS.md`](AGENTS.md) — the single
+The full rules are in [`AGENTS.md`](AGENTS.md), the single
 canonical agent/contributor rules file (`CLAUDE.md` is just a pointer to
 it). Short version:
 
@@ -129,7 +147,7 @@ Highlights for contributors:
 - Config is read once at startup; never call `std::env::var` outside `Config::load`.
 - Atomic file writes only: tmp + rename + fsync; never write in-place.
 - Every wiki page is namespaced by `(workspace_id, project_id)`.
-- The CLI is always a thin HTTP client to the running server — it never
+- The CLI is always a thin HTTP client to the running server. It never
   opens the SQLite file or the wiki directory directly.
 
 ## Versioning and deprecation policy
@@ -151,7 +169,7 @@ than the following major release.
 ### How this affects your PR
 
 - Put your CHANGELOG entry under the heading that matches its semver
-  impact — `### Fixed` for bug fixes, `### Added` for new capabilities,
+  impact: `### Fixed` for bug fixes, `### Added` for new capabilities,
   `### Changed` for altered behaviour. The maintainer reads the
   `[Unreleased]` section to pick the next version number, so a fix filed
   under `Added` (or vice versa) can bump the wrong release.
@@ -159,7 +177,7 @@ than the following major release.
   surface, changed MCP schema), say so explicitly in the PR description
   so it gets the `breaking-change` label and is scheduled for the next
   major instead of blocking patch/minor releases.
-- Bug fixes ship in the next **patch** release, usually promptly —
-  they are not held for feature releases. Small additive features (a new
+- Bug fixes ship in the next **patch** release, usually promptly, and
+  are not held for feature releases. Small additive features (a new
   agent harness, LLM provider, install client) ship in the next
   **minor**.

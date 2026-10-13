@@ -32,11 +32,36 @@ pub struct IngestMetrics {
     /// Events accepted but deliberately not stored — capture policy or the
     /// subagent drop. Still a 202: the client must not retry these.
     dropped_by_policy: AtomicU64,
+    /// Events accepted but not stored because the authenticated user holds no
+    /// `write` access to the project the capture resolved to.
+    ///
+    /// Separate from `dropped_by_policy` on purpose. A policy drop is the
+    /// operator's own configuration working as intended; this one means
+    /// somebody's agent has been recording into a repository all day and none
+    /// of it is landing. Those want different answers, so they must not share
+    /// a counter.
+    dropped_unauthorized: AtomicU64,
+    /// Batch items accepted but not stored because they can never be: an
+    /// event with no session id that is not a SessionStart. Acknowledged so
+    /// the spool drops them instead of retrying them ahead of valid events.
+    dropped_invalid: AtomicU64,
     /// Events shed because the global ingest semaphore had no permit (429).
     shed_saturated: AtomicU64,
     /// Events shed by the per-source rate limiter (429).
     shed_rate_limited: AtomicU64,
-    /// Unix milliseconds of the last event that reached the writer, or 0
+    /// Completed hook deliveries classified as `stored`.
+    stored: AtomicU64,
+    /// Completed hook deliveries classified as `replayed`.
+    replayed: AtomicU64,
+    /// Completed hook deliveries classified as `resumed`.
+    resumed: AtomicU64,
+    /// Completed hook deliveries classified as `ignored_end`.
+    ignored_end: AtomicU64,
+    /// Completed hook deliveries classified as `dropped_collision`.
+    dropped_collision: AtomicU64,
+    /// Completed hook deliveries classified as `failed`.
+    failed: AtomicU64,
+    /// Unix milliseconds of the last newly persisted observation or effect, or 0
     /// when none has since this process started.
     last_persisted_ms: AtomicU64,
 }
@@ -50,6 +75,14 @@ impl IngestMetrics {
     pub fn record_dropped_by_policy(&self) {
         self.dropped_by_policy.fetch_add(1, Ordering::Relaxed);
     }
+    /// One capture dropped because its author may not write that repository.
+    pub fn record_dropped_unauthorized(&self) {
+        self.dropped_unauthorized.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One batch item dropped because it can never be stored.
+    pub fn record_dropped_invalid(&self) {
+        self.dropped_invalid.fetch_add(1, Ordering::Relaxed);
+    }
     /// One event shed because ingest capacity was exhausted.
     pub fn record_shed_saturated(&self) {
         self.shed_saturated.fetch_add(1, Ordering::Relaxed);
@@ -57,6 +90,30 @@ impl IngestMetrics {
     /// One event shed by the per-source rate limiter.
     pub fn record_shed_rate_limited(&self) {
         self.shed_rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `stored` delivery.
+    pub fn record_stored(&self) {
+        self.stored.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `replayed` delivery.
+    pub fn record_replayed(&self) {
+        self.replayed.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `resumed` delivery.
+    pub fn record_resumed(&self) {
+        self.resumed.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `ignored_end` delivery.
+    pub fn record_ignored_end(&self) {
+        self.ignored_end.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `dropped_collision` delivery.
+    pub fn record_dropped_collision(&self) {
+        self.dropped_collision.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `failed` delivery.
+    pub fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
     }
     /// Stamp the moment an event reached durable storage.
     pub fn record_persisted(&self, unix_ms: u64) {
@@ -68,7 +125,16 @@ impl IngestMetrics {
     pub fn snapshot(&self) -> IngestMetricsSnapshot {
         IngestMetricsSnapshot {
             accepted: self.accepted.load(Ordering::Relaxed),
+            stored: self.stored.load(Ordering::Relaxed),
+            replayed: self.replayed.load(Ordering::Relaxed),
+            resumed: self.resumed.load(Ordering::Relaxed),
+            ignored_end: self.ignored_end.load(Ordering::Relaxed),
+            dropped_collision: self.dropped_collision.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+
             dropped_by_policy: self.dropped_by_policy.load(Ordering::Relaxed),
+            dropped_unauthorized: self.dropped_unauthorized.load(Ordering::Relaxed),
+            dropped_invalid: self.dropped_invalid.load(Ordering::Relaxed),
             shed_saturated: self.shed_saturated.load(Ordering::Relaxed),
             shed_rate_limited: self.shed_rate_limited.load(Ordering::Relaxed),
             last_persisted_ms: match self.last_persisted_ms.load(Ordering::Relaxed) {
@@ -86,11 +152,28 @@ pub struct IngestMetricsSnapshot {
     pub accepted: u64,
     /// Events accepted but intentionally not stored.
     pub dropped_by_policy: u64,
+    /// Captures dropped because their author may not write that repository.
+    pub dropped_unauthorized: u64,
+    /// Batch items dropped because they can never be stored (no session id,
+    /// or a purged session).
+    pub dropped_invalid: u64,
     /// Events shed because ingest capacity was exhausted.
     pub shed_saturated: u64,
     /// Events shed by the per-source rate limiter.
     pub shed_rate_limited: u64,
-    /// Unix ms of the last event that reached the writer, if any.
+    /// Hook deliveries classified as `stored`.
+    pub stored: u64,
+    /// Hook deliveries classified as `replayed`.
+    pub replayed: u64,
+    /// Hook deliveries classified as `resumed`.
+    pub resumed: u64,
+    /// Hook deliveries classified as `ignored_end`.
+    pub ignored_end: u64,
+    /// Hook deliveries classified as `dropped_collision`.
+    pub dropped_collision: u64,
+    /// Hook deliveries classified as `failed`.
+    pub failed: u64,
+    /// Unix ms of the last newly persisted observation or effect, if any.
     pub last_persisted_ms: Option<u64>,
 }
 
@@ -103,6 +186,8 @@ mod tests {
         let snap = IngestMetrics::default().snapshot();
         assert_eq!(snap.accepted, 0);
         assert_eq!(snap.dropped_by_policy, 0);
+        assert_eq!(snap.dropped_unauthorized, 0);
+        assert_eq!(snap.dropped_invalid, 0);
         assert_eq!(snap.shed_saturated, 0);
         assert_eq!(snap.shed_rate_limited, 0);
         assert_eq!(
@@ -129,6 +214,26 @@ mod tests {
         assert_eq!(s.last_persisted_ms, Some(1_700_000_000_000));
     }
 
+    #[test]
+    fn additive_outcomes_do_not_change_admission_or_last_write() {
+        let metrics = IngestMetrics::default();
+        metrics.record_stored();
+        metrics.record_replayed();
+        metrics.record_resumed();
+        metrics.record_ignored_end();
+        metrics.record_dropped_collision();
+        metrics.record_failed();
+        let s = metrics.snapshot();
+        assert_eq!(
+            (s.stored, s.replayed, s.resumed, s.ignored_end),
+            (1, 1, 1, 1)
+        );
+        assert_eq!((s.dropped_collision, s.failed), (1, 1));
+        assert_eq!(s.accepted, 0);
+        assert_eq!(s.dropped_by_policy, 0);
+        assert_eq!(s.last_persisted_ms, None);
+    }
+
     /// The shape is the privacy contract: counts and one timestamp, nothing
     /// that could carry a prompt, path, or tool payload. If a field carrying
     /// captured text is ever added, this fails loudly (#428).
@@ -144,9 +249,17 @@ mod tests {
             vec![
                 "accepted",
                 "dropped_by_policy",
+                "dropped_collision",
+                "dropped_invalid",
+                "dropped_unauthorized",
+                "failed",
+                "ignored_end",
                 "last_persisted_ms",
+                "replayed",
+                "resumed",
                 "shed_rate_limited",
-                "shed_saturated"
+                "shed_saturated",
+                "stored"
             ]
         );
         for v in value.as_object().unwrap().values() {

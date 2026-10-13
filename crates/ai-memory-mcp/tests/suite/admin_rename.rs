@@ -21,7 +21,9 @@ use tower::ServiceExt;
 
 async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let store = Store::open(tmp.path()).unwrap();
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
@@ -34,6 +36,8 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
@@ -123,6 +127,11 @@ async fn rename_project_happy_path() {
         1,
         "one page under new name: {body}"
     );
+    assert!(body["manifest_warning"].is_null(), "{body}");
+    assert!(
+        body["checkpoint"].as_str().is_some(),
+        "manifest refresh must be checkpointed: {body}"
+    );
 
     // Verify the project row was actually renamed in the DB.
     let ws = store
@@ -146,10 +155,70 @@ async fn rename_project_happy_path() {
         .await
         .unwrap();
     assert!(new_id.is_some(), "new project name must be findable");
+    let manifest = std::fs::read_to_string(
+        tmp.path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(new_id.unwrap().to_string())
+            .join("_meta.md"),
+    )
+    .unwrap();
+    assert!(manifest.contains("project: new-name"), "{manifest}");
 }
 
 /// Conflict: renaming `default/keep` to `default/doomed` when `doomed`
 /// already exists must return 422.
+#[tokio::test]
+async fn rename_project_manifest_failure_is_disclosed_after_commit() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "old-name").await;
+    let workspace = store
+        .reader
+        .find_workspace("default".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let project = store
+        .reader
+        .find_project(workspace, "old-name".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest = tmp
+        .path()
+        .join("wiki")
+        .join(workspace.to_string())
+        .join(project.to_string())
+        .join("_meta.md");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let resp = post(
+        state,
+        "/admin/rename-project",
+        json!({ "workspace": "default", "from": "old-name", "to": "new-name" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(
+        body["manifest_warning"]
+            .as_str()
+            .is_some_and(|warning| !warning.is_empty()),
+        "{body}"
+    );
+    assert!(
+        store
+            .reader
+            .find_project(workspace, "new-name".into())
+            .await
+            .unwrap()
+            .is_some(),
+        "the SQL rename stays committed"
+    );
+}
+
 #[tokio::test]
 async fn rename_project_conflict_returns_422() {
     let tmp = TempDir::new().unwrap();
@@ -314,6 +383,8 @@ async fn rename_project_pages_still_searchable() {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
@@ -388,6 +459,8 @@ async fn rename_project_after_purge_returns_404_not_silent_200() {
         embedder: state.embedder.clone(),
         provider_health: state.provider_health.clone(),
         decay_params: state.decay_params,
+        contradiction_band_min: state.contradiction_band_min,
+        contradiction_band_max: state.contradiction_band_max,
         data_dir: state.data_dir.clone(),
         db_path: state.db_path.clone(),
         bind: state.bind.clone(),

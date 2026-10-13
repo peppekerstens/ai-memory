@@ -6,8 +6,11 @@
 //! prompts, hooks, or LLM output), so raw HTML is escaped and unsafe
 //! link schemes are neutralised.
 
-use ai_memory_core::PagePath;
-use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
+
+use ai_memory_core::{DEFAULT_WORKSPACE_NAME, GLOBAL_SCOPE_PROJECT, PagePath};
+use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
 /// Render a markdown body to HTML using GFM-ish defaults.
 ///
@@ -15,21 +18,15 @@ use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 /// Wiki content can be derived from prompts, hooks, or LLM output, so
 /// the browser surface must treat it as untrusted.
 ///
-/// `[[wiki links]]` (with the `[[target|label]]`, `[[project:path]]`, and
-/// `[[workspace/project:path]]` variants the engine's link extractor
-/// understands) are rendered as clickable internal links resolved against
-/// the page's own `workspace`/`project` unless the target carries its own
-/// scope. Wikilinks inside fenced code blocks and inline code are left as
-/// literal text.
+/// `[[wiki links]]` (with the `[[target|label]]`, `[[project:path]]`,
+/// `[[workspace/project:path]]`, and reserved `[[_global:path]]` variants
+/// the engine's link extractor understands) are rendered as clickable
+/// internal links resolved against the page's own `workspace`/`project`
+/// unless the target carries its own scope. `[[_global:path]]` always
+/// points at the `_global` project in the default workspace. Wikilinks
+/// inside fenced code blocks and inline code are left as literal text.
 #[must_use]
 pub fn render(body: &str, workspace: &str, project: &str) -> String {
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_FOOTNOTES);
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TASKLISTS);
-    opts.insert(Options::ENABLE_SMART_PUNCTUATION);
-
     // Rewrite `[[wikilinks]]` into ordinary markdown links BEFORE parsing.
     // pulldown-cmark consumes `[...]` as reference-link syntax, so the brackets
     // never survive as a single text node — preprocessing the source is the
@@ -37,11 +34,25 @@ pub fn render(body: &str, workspace: &str, project: &str) -> String {
     // there, mirroring the engine's link extractor.
     let body = preprocess_wikilinks(body, workspace, project);
 
-    let parser =
-        Parser::new_ext(&body, opts).map(|event| sanitize_event(event, workspace, project));
+    let parser = Parser::new_ext(&body, options());
+    let with_headings = HeadingIdAssigner::new(parser);
+    let sanitized = with_headings.map(|event| sanitize_event(event, workspace, project));
     let mut out = String::with_capacity(body.len() + body.len() / 4);
-    html::push_html(&mut out, parser);
+    html::push_html(&mut out, sanitized);
     out
+}
+
+/// The GFM-ish parser options the page renders with. The wikilink
+/// preprocessor parses with the same ones, so it skips exactly the code
+/// the renderer will show as code.
+fn options() -> Options {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+    opts
 }
 
 /// Rewrite a relative in-wiki link target (a page like `concepts/foo.md`
@@ -77,8 +88,12 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
     if path_part.is_empty() || path_part.contains("..") {
         return dest; // don't rewrite traversal; safe_url/router will reject
     }
-    let path_part = path_part.trim_end_matches('/');
-    if path_part.is_empty() {
+    let mut path_part = path_part.trim_end_matches('/');
+    while let Some(rest) = path_part.strip_prefix("./") {
+        path_part = rest;
+    }
+    // `.//x` would leave a leading `/` and an empty first segment.
+    if path_part.is_empty() || path_part == "." || path_part.starts_with('/') {
         return dest;
     }
     CowStr::Boxed(
@@ -91,68 +106,53 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
 }
 
 /// Convert `[[target]]` / `[[target|label]]` spans into `[label](href)`
-/// markdown links, skipping fenced code blocks, inline-code spans, and
-/// 4-space-indented code blocks. Targets that aren't internal pages
-/// (external schemes, traversal, empty) are left as literal `[[…]]`.
+/// markdown links, skipping code (fenced and indented code blocks and
+/// inline-code spans) and raw HTML blocks. Targets that aren't internal pages (external
+/// schemes, traversal, empty) are left as literal `[[…]]`.
+///
+/// What counts as code is what the renderer's own parser reads as code,
+/// not a guess from indentation: four spaces open a code block only where
+/// CommonMark says they do, so a nested list item or a paragraph's
+/// continuation line indented four spaces is text, and its wikilink is
+/// rewritten like any other (the engine's link extractor indexes it).
+///
+/// An HTML block is shown as escaped source text, so markdown inside it
+/// is never parsed: a rewritten wikilink would surface as its generated
+/// `[label](w/…/p/….md)` markup instead of the `[[…]]` the page holds.
 fn preprocess_wikilinks(body: &str, workspace: &str, project: &str) -> String {
     let mut out = String::with_capacity(body.len() + 64);
-    // None when outside a fence; Some(char) carrying the opener glyph
-    // (`'`' ` for ```` ``` ````, `'~'` for `~~~`) when inside one. The
-    // CommonMark rule is that a fence closes only with the *same* glyph,
-    // so opening with `~~~` ignores a `` ``` `` line in between and
-    // vice versa.
-    let mut fence: Option<char> = None;
-    for line in body.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let leading_indent = line.len() - trimmed.len();
-        if let Some(kind) = fence_glyph(trimmed) {
-            match fence {
-                None => fence = Some(kind),
-                Some(open) if open == kind => fence = None,
-                _ => {} // Mismatched glyph inside a fenced block — literal text.
-            }
-            out.push_str(line);
-            continue;
-        }
-        if fence.is_some() {
-            out.push_str(line);
-            continue;
-        }
-        // 4-space-indented (or tab-indented) lines are CommonMark code
-        // blocks. A wikilink inside one must stay literal so it ends up
-        // inside the rendered `<pre><code>…</code></pre>`. Blank-only
-        // indented lines are pass-through (paragraph continuation).
-        if !trimmed.is_empty() && (leading_indent >= 4 || line.starts_with('\t')) {
-            out.push_str(line);
-            continue;
-        }
-        // Split on backticks: even segments are outside inline code, odd ones
-        // are inside it (left verbatim). Unbalanced backticks degrade safely.
-        for (i, seg) in line.split('`').enumerate() {
-            if i > 0 {
-                out.push('`');
-            }
-            if i % 2 == 0 {
-                rewrite_wikilinks_in_text(seg, workspace, project, &mut out);
-            } else {
-                out.push_str(seg);
-            }
-        }
+    let mut pos = 0;
+    for code in literal_ranges(body) {
+        rewrite_wikilinks_in_lines(&body[pos..code.start], workspace, project, &mut out);
+        out.push_str(&body[code.clone()]);
+        pos = code.end;
     }
+    rewrite_wikilinks_in_lines(&body[pos..], workspace, project, &mut out);
     out
 }
 
-/// If `trimmed` opens or closes a CommonMark code fence, return its
-/// opener glyph (`` ` `` or `~`). CommonMark requires at least three
-/// of the same glyph; we accept the lenient "starts with three" rule
-/// to mirror the pulldown-cmark parser's behaviour for our preprocessor.
-fn fence_glyph(trimmed: &str) -> Option<char> {
-    if trimmed.starts_with("```") {
-        Some('`')
-    } else if trimmed.starts_with("~~~") {
-        Some('~')
-    } else {
-        None
+/// Byte ranges of `body` the renderer shows verbatim (fenced and indented
+/// code blocks, inline-code spans, raw HTML blocks) as its parser reads
+/// them, in document order and without overlap.
+fn literal_ranges(body: &str) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for (event, range) in Parser::new_ext(body, options()).into_offset_iter() {
+        if matches!(
+            event,
+            Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) | Event::Code(_)
+        ) && ranges.last().is_none_or(|last| range.start >= last.end)
+        {
+            ranges.push(range);
+        }
+    }
+    ranges
+}
+
+/// Rewrite the wikilinks of a run of non-code text one line at a time, so
+/// an unterminated `[[` never pairs with a `]]` on a later line.
+fn rewrite_wikilinks_in_lines(text: &str, workspace: &str, project: &str, out: &mut String) {
+    for line in text.split_inclusive('\n') {
+        rewrite_wikilinks_in_text(line, workspace, project, out);
     }
 }
 
@@ -230,10 +230,17 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     // Optional `[workspace/]project:` scope qualifier.
     let (ws, proj, path_part) = split_scope(target, workspace, project);
 
-    // Strip anchor/query, reject non-page extensions, normalise the `.md`
-    // suffix, then rely on the canonical page-path validator for traversal,
-    // absolute paths, Windows prefixes, backslashes, and empty segments.
-    let path = path_part.split(['#', '?']).next().unwrap_or("").trim();
+    // Split off a trailing #anchor/?query so it survives the rewrite,
+    // matching scope_relative_link.
+    let (path_part, suffix) = match path_part.find(['#', '?']) {
+        Some(i) => (&path_part[..i], &path_part[i..]),
+        None => (path_part, ""),
+    };
+
+    // Reject non-page extensions, normalise the `.md` suffix, then rely on
+    // the canonical page-path validator for traversal, absolute paths,
+    // Windows prefixes, backslashes, and empty segments.
+    let path = path_part.trim();
     if path.is_empty() {
         return None;
     }
@@ -248,7 +255,11 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     };
     let path = PagePath::new(path).ok()?;
 
-    let href = crate::templates::page_href(ws, proj, path.as_str());
+    let href = format!(
+        "{}{}",
+        crate::templates::page_href(ws, proj, path.as_str()),
+        encode_link_suffix(suffix)
+    );
     let display = label
         .filter(|l| !l.is_empty())
         .unwrap_or(target)
@@ -256,10 +267,54 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     Some((href, display))
 }
 
+/// Percent-encode a wikilink's `#anchor` / `?query` suffix for a Markdown
+/// link destination. A space, parenthesis, angle bracket, quote or backslash
+/// would end or break the bare `[label](href)` destination; the URI delimiters
+/// a fragment or query uses (and existing `%` escapes) stay as written.
+fn encode_link_suffix(suffix: &str) -> String {
+    let mut out = String::with_capacity(suffix.len());
+    for byte in suffix.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@'
+            | b'/'
+            | b'?'
+            | b'#'
+            | b'%' => out.push(byte as char),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
 /// Peel an optional `[workspace/]project:` scope off a wikilink target,
 /// defaulting to the current page's `workspace`/`project`. A `scope` made of
 /// anything other than `[-_/.alnum]` is treated as part of the path (so a
 /// stray colon in a filename doesn't masquerade as a scope).
+///
+/// `[[_global:path]]` always names the reserved preferences project in
+/// [`DEFAULT_WORKSPACE_NAME`], even when the current page lives elsewhere
+/// (issue #1042). An explicit `[[workspace/_global:path]]` keeps the named
+/// workspace.
 fn split_scope<'a>(
     target: &'a str,
     cur_ws: &'a str,
@@ -277,11 +332,170 @@ fn split_scope<'a>(
                     (ws.trim(), proj.trim(), rest.trim())
                 }
                 Some(_) => (cur_ws, cur_proj, target), // malformed `ws/`
+                None if scope == GLOBAL_SCOPE_PROJECT => {
+                    (DEFAULT_WORKSPACE_NAME, scope, rest.trim())
+                }
                 None => (cur_ws, scope, rest.trim()),
             };
         }
     }
     (cur_ws, cur_proj, target)
+}
+
+/// Iterator adapter that ensures every `Tag::Heading` event has a unique `id`.
+///
+/// If a heading does not already carry an `id`, its inner text events are
+/// buffered until `TagEnd::Heading`, converted to a URL-safe slug, deduplicated
+/// against other headings on the page, and assigned to the heading start tag.
+struct HeadingIdAssigner<'a, I> {
+    iter: I,
+    slugger: HeadingSlugger,
+    queue: VecDeque<Event<'a>>,
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> HeadingIdAssigner<'a, I> {
+    fn new(iter: I) -> Self {
+        Self {
+            iter,
+            slugger: HeadingSlugger::default(),
+            queue: VecDeque::new(),
+        }
+    }
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> Iterator for HeadingIdAssigner<'a, I> {
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(event) = self.queue.pop_front() {
+            return Some(event);
+        }
+
+        let event = self.iter.next()?;
+        match event {
+            Event::Start(Tag::Heading {
+                level,
+                id,
+                classes,
+                attrs,
+            }) => {
+                let mut text = String::new();
+                let mut inner_events = Vec::new();
+                let mut end_level = None;
+
+                for next_event in self.iter.by_ref() {
+                    match next_event {
+                        Event::End(TagEnd::Heading(lvl)) => {
+                            end_level = Some(lvl);
+                            break;
+                        }
+                        Event::Text(s) => {
+                            text.push_str(&s);
+                            inner_events.push(Event::Text(s));
+                        }
+                        Event::Code(s) => {
+                            text.push_str(&s);
+                            inner_events.push(Event::Code(s));
+                        }
+                        Event::InlineMath(s) => {
+                            text.push_str(&s);
+                            inner_events.push(Event::InlineMath(s));
+                        }
+                        Event::DisplayMath(s) => {
+                            text.push_str(&s);
+                            inner_events.push(Event::DisplayMath(s));
+                        }
+                        other => {
+                            inner_events.push(other);
+                        }
+                    }
+                }
+
+                let id_str = match id {
+                    Some(custom) => self.slugger.deduplicate(custom.as_ref()),
+                    None => self.slugger.slugify(&text),
+                };
+                self.queue.push_back(Event::Start(Tag::Heading {
+                    level,
+                    id: Some(CowStr::Boxed(id_str.into_boxed_str())),
+                    classes,
+                    attrs,
+                }));
+                self.queue.extend(inner_events);
+                if let Some(lvl) = end_level {
+                    self.queue.push_back(Event::End(TagEnd::Heading(lvl)));
+                }
+
+                self.queue.pop_front()
+            }
+            other => Some(other),
+        }
+    }
+}
+
+/// State for tracking and deduplicating heading slugs across a rendered page.
+#[derive(Default)]
+struct HeadingSlugger {
+    seen: HashSet<String>,
+    counts: HashMap<String, usize>,
+}
+
+impl HeadingSlugger {
+    fn slugify(&mut self, text: &str) -> String {
+        let base = slugify(text);
+        self.deduplicate(&base)
+    }
+
+    fn deduplicate(&mut self, base: &str) -> String {
+        let base = if base.is_empty() { "section" } else { base };
+        if self.seen.insert(base.to_string()) {
+            return base.to_string();
+        }
+        let counter = self.counts.entry(base.to_string()).or_insert(1);
+        loop {
+            let candidate = format!("{base}-{counter}");
+            *counter += 1;
+            if self.seen.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+    }
+}
+
+/// Convert heading text to a URL-friendly slug.
+///
+/// Converts alphanumeric characters to lowercase, replaces whitespace,
+/// dashes and hyphens with `-` (collapsing consecutive separators),
+/// preserves underscores, and strips punctuation. Empty results fall back
+/// to `"section"`.
+fn slugify(text: &str) -> String {
+    let mut slug = String::with_capacity(text.len());
+    let mut prev_is_dash = false;
+
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            for lc in c.to_lowercase() {
+                slug.push(lc);
+            }
+            prev_is_dash = false;
+        } else if c == '_' {
+            slug.push(c);
+            prev_is_dash = false;
+        } else if (c == '-' || c == '—' || c == '–' || c.is_whitespace())
+            && !slug.is_empty()
+            && !prev_is_dash
+        {
+            slug.push('-');
+            prev_is_dash = true;
+        }
+    }
+
+    let trimmed = slug.trim_end_matches('-');
+    if trimmed.is_empty() {
+        "section".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn sanitize_event<'a>(event: Event<'a>, workspace: &str, project: &str) -> Event<'a> {
@@ -331,27 +545,91 @@ fn safe_url(url: CowStr<'_>) -> CowStr<'_> {
     }
 }
 
-/// Allow images only from the current origin.
+/// Allow images only from relative paths under the web mount.
 ///
 /// Unlike links, images are fetched as soon as untrusted markdown is viewed.
 /// An absolute or network-path URL would therefore disclose the viewer's IP,
 /// user agent, and view timing without a click. Keep ordinary external links
 /// clickable, but neutralise every non-relative image target. Backslashes are
 /// rejected because browsers can interpret them as URL path separators.
+///
+/// The fetch is also same-origin, so it carries the viewer's standing with
+/// the server: a target that resolved to a machine or admin route would run
+/// that route as the viewer. Root-relative targets and `..` segments (also
+/// percent-encoded, which browsers resolve as dot segments) could climb out
+/// of the web mount, and a first segment naming a server route reaches it
+/// when the UI is mounted at the base-path root (`--web-slug /`).
 fn safe_image_url(url: CowStr<'_>) -> CowStr<'_> {
-    let trimmed = url.trim_start();
-    let is_network_path = trimmed.starts_with("//")
-        || trimmed.starts_with("\\\\")
-        || trimmed.starts_with("/\\")
-        || trimmed.starts_with("\\/");
-    let is_relative =
-        trimmed.starts_with('/') || trimmed.starts_with('#') || !trimmed.contains(':');
-
-    if !trimmed.is_empty() && is_relative && !is_network_path && !trimmed.contains('\\') {
+    if is_safe_image_target(&url) {
         url
     } else {
         CowStr::Boxed("#".into())
     }
+}
+
+/// Top-level server routes outside the web UI. A relative image whose first
+/// segment matches one would hit it when the UI is mounted at the root.
+const SERVER_ROUTE_SEGMENTS: &[&str] = &[
+    "admin",
+    "auth",
+    "handoff",
+    "hook",
+    "identity",
+    "mcp",
+    "workstream",
+];
+
+fn is_safe_image_target(url: &str) -> bool {
+    // Browsers trim leading and trailing C0 controls and spaces; the HTML
+    // writer percent-encodes the rest, so no other control reaches the URL.
+    let cleaned = url.trim_matches(|c: char| c <= ' ');
+    if cleaned.is_empty() {
+        return false;
+    }
+    if cleaned.starts_with('#') {
+        return true;
+    }
+    if cleaned.starts_with('/') || cleaned.contains(['\\', ':']) {
+        return false;
+    }
+    let path = cleaned.split(['?', '#']).next().unwrap_or_default();
+    let decoded = percent_decode_lossy(path);
+    if decoded.starts_with('/')
+        || decoded.contains('\\')
+        || decoded.split('/').any(|segment| segment == "..")
+    {
+        return false;
+    }
+    let first = decoded
+        .split('/')
+        .find(|segment| !segment.is_empty() && *segment != ".")
+        .unwrap_or_default();
+    !SERVER_ROUTE_SEGMENTS
+        .iter()
+        .any(|route| first.eq_ignore_ascii_case(route))
+}
+
+/// Decode `%XX` escapes once, the way a URL parser sees dot segments.
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| char::from(b).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// True when `target` carries a URL scheme that should never be
@@ -400,29 +678,37 @@ fn escape_html(input: &str) -> String {
     out
 }
 
-/// Drop the leading H1 from a markdown body if present. Static-site
-/// convention: the first H1 IS the page title, and the page template
-/// already renders the title in its header — leaving it in the body
-/// duplicates it on screen. No-op when the body doesn't start with
-/// an H1 (handles `# Title`, both ATX `# Title` and setext
-/// `Title\n=====` forms).
+/// Drop the leading H1 from a markdown body when it repeats `title`.
+/// Static-site convention: the first H1 IS the page title, and the page
+/// template already renders the title in its header — leaving it in the
+/// body duplicates it on screen. An H1 that reads differently is not a
+/// duplicate: a frontmatter `title:` outranks the H1, and a setext H1 never
+/// names the page at all, so dropping one of those hid the only place the
+/// page said it. No-op when the body doesn't start with that H1 (handles
+/// both ATX `# Title` and setext `Title\n=====` forms).
 #[must_use]
-pub fn strip_leading_h1(body: &str) -> &str {
+pub fn strip_leading_h1<'a>(body: &'a str, title: &str) -> &'a str {
+    let title = title.trim();
     // Skip any leading blank lines.
     let trimmed = body.trim_start_matches(['\n', '\r']);
     // ATX form: `# Title` (one `#`, NOT `## …`).
     if let Some(rest) = trimmed.strip_prefix("# ") {
-        let after_line = rest.find('\n').map_or("", |nl| &rest[nl + 1..]);
-        return after_line.trim_start_matches(['\n', '\r']);
+        let (heading, after_line) = rest.split_once('\n').unwrap_or((rest, ""));
+        if heading.trim() == title {
+            return after_line.trim_start_matches(['\n', '\r']);
+        }
+        return body;
     }
     // Setext form: `Title\n====…` (1+ equals signs). Look ahead.
     if let Some((first_line, after_first)) = trimmed.split_once('\n')
         && !first_line.is_empty()
-        && let Some((second_line, after_second)) = after_first.split_once('\n')
-        && !second_line.is_empty()
-        && second_line.chars().all(|c| c == '=')
+        && first_line.trim() == title
     {
-        return after_second.trim_start_matches(['\n', '\r']);
+        let (second_line, after_second) = after_first.split_once('\n').unwrap_or((after_first, ""));
+        let underline = second_line.trim_end_matches(['\r', ' ', '\t']);
+        if !underline.is_empty() && underline.chars().all(|c| c == '=') {
+            return after_second.trim_start_matches(['\n', '\r']);
+        }
     }
     body
 }
@@ -434,7 +720,7 @@ mod tests {
     #[test]
     fn renders_basic_markdown() {
         let html = render("# Hello\n\nworld", "default", "scratch");
-        assert!(html.contains("<h1>Hello</h1>"));
+        assert!(html.contains(r#"<h1 id="hello">Hello</h1>"#));
         assert!(html.contains("<p>world</p>"));
     }
 
@@ -519,8 +805,10 @@ mod tests {
     fn preserves_relative_images() {
         for target in [
             "images/diagram.png",
-            "../shared/diagram.png",
-            "/static/logo.svg",
+            "./images/diagram.png",
+            "static/logo.png",
+            "diagram.png?v=2",
+            "#figure-1",
         ] {
             let markdown = format!("![local]({target})");
             let html = render(&markdown, "default", "scratch");
@@ -528,6 +816,41 @@ mod tests {
                 html.contains(&format!(r#"src="{target}""#)),
                 "target {target}: {html}"
             );
+        }
+    }
+
+    /// A same-origin image fetch runs as the viewer, so a stored page must not
+    /// be able to point one at a machine or admin route (the handoff claim, an
+    /// admin job): root-relative, network-path, dot-segment (plain or
+    /// percent-encoded) and root-mounted route targets are all neutralised.
+    #[test]
+    fn neutralises_images_that_reach_server_routes() {
+        for target in [
+            "/handoff?workspace=default&project=scratch",
+            "/admin/backup",
+            "/static/logo.png",
+            "//evil.example/x.png",
+            "../../../../handoff?workspace=default&project=scratch",
+            "%2e%2e/%2e%2e/handoff?workspace=default&project=scratch",
+            ".%2E/admin/backup",
+            "images/%2e%2e/%2e%2e/handoff",
+            "../shared/diagram.png",
+            // `--web-slug /` puts the UI at the root, where these relative
+            // targets resolve straight to the server routes.
+            "handoff?workspace=default&project=scratch",
+            "./handoff",
+            ".//handoff",
+            "Admin/backup",
+            "mcp",
+            "hook/batch",
+            "workstream/runs",
+            "identity",
+            "%2fhandoff",
+        ] {
+            let markdown = format!("![pixel](<{target}>)");
+            let html = render(&markdown, "default", "scratch");
+            assert!(html.contains("src=\"#\""), "target {target}: {html}");
+            assert!(html.contains("alt=\"pixel\""), "target {target}: {html}");
         }
     }
 
@@ -540,39 +863,78 @@ mod tests {
 
     #[test]
     fn strip_atx_h1_drops_first_heading() {
-        let out = strip_leading_h1("# Title\n\nbody text\n");
+        let out = strip_leading_h1("# Title\n\nbody text\n", "Title");
         assert_eq!(out, "body text\n");
     }
 
     #[test]
     fn strip_atx_h1_tolerates_leading_blank_lines() {
-        let out = strip_leading_h1("\n\n# Title\n\nbody\n");
+        let out = strip_leading_h1("\n\n# Title\n\nbody\n", "Title");
         assert_eq!(out, "body\n");
     }
 
     #[test]
     fn strip_atx_h1_leaves_h2_alone() {
-        let out = strip_leading_h1("## Subhead\n\nbody\n");
+        let out = strip_leading_h1("## Subhead\n\nbody\n", "Subhead");
         assert_eq!(out, "## Subhead\n\nbody\n");
     }
 
     #[test]
     fn strip_atx_h1_leaves_body_without_title_alone() {
-        let out = strip_leading_h1("just a paragraph\n");
+        let out = strip_leading_h1("just a paragraph\n", "Title");
         assert_eq!(out, "just a paragraph\n");
     }
 
     #[test]
+    fn strip_atx_h1_keeps_a_heading_that_is_not_the_title() {
+        let body = "# Token refresh\n\nbody\n";
+        assert_eq!(strip_leading_h1(body, "Auth decisions"), body);
+        // A heading-only body that repeats the title leaves nothing.
+        assert_eq!(strip_leading_h1("# Title", "Title"), "");
+        assert_eq!(strip_leading_h1("# Title\r\n\r\nbody", "Title"), "body");
+    }
+
+    #[test]
     fn strip_setext_h1_drops_first_heading() {
-        let out = strip_leading_h1("Title\n=====\n\nbody\n");
+        let out = strip_leading_h1("Title\n=====\n\nbody\n", "Title");
         assert_eq!(out, "body\n");
+    }
+
+    #[test]
+    fn strip_setext_h1_keeps_a_heading_that_is_not_the_title() {
+        let body = "Cache warmup\n============\n\nbody\n";
+        assert_eq!(strip_leading_h1(body, "setext"), body);
     }
 
     #[test]
     fn strip_does_not_eat_setext_h2() {
         // `----` underlines are H2, not H1. Leave them alone.
-        let out = strip_leading_h1("Title\n----\n\nbody\n");
+        let out = strip_leading_h1("Title\n----\n\nbody\n", "Title");
         assert_eq!(out, "Title\n----\n\nbody\n");
+    }
+
+    #[test]
+    fn strip_setext_h1_handles_crlf_and_trailing_whitespace() {
+        let out = strip_leading_h1("Title\r\n=====\r\n\r\nbody\r\n", "Title");
+        assert_eq!(out, "body\r\n");
+
+        let out = strip_leading_h1("Title\n=====   \t\n\nbody\n", "Title");
+        assert_eq!(out, "body\n");
+
+        let out = strip_leading_h1("Title\r\n=====  \r\n\r\nbody\r\n", "Title");
+        assert_eq!(out, "body\r\n");
+
+        // Negative control: an underline with inner spaces is not a setext
+        // H1 underline — the heading must survive stripping.
+        let out = strip_leading_h1("Title\r\n== x ==\r\nbody", "Title");
+        assert_eq!(out, "Title\r\n== x ==\r\nbody");
+    }
+
+    #[test]
+    fn strip_setext_h1_handles_eof_without_trailing_newline() {
+        assert_eq!(strip_leading_h1("Title\n=====", "Title"), "");
+        assert_eq!(strip_leading_h1("Title\r\n=====\r", "Title"), "");
+        assert_eq!(strip_leading_h1("\r\n\r\nTitle\r\n=====", "Title"), "");
     }
 
     #[test]
@@ -600,6 +962,66 @@ mod tests {
     }
 
     #[test]
+    fn wikilink_preserves_anchor_and_query_suffix() {
+        let html = render(
+            "see [[notes/foo#section-1]] and [[notes/bar.md#section-2|Bar Section]]",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains(
+                r#"href="w/default/scratch/p/notes/foo.md#section-1">notes/foo#section-1</a>"#
+            ),
+            "bare anchor: {html}"
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/bar.md#section-2">Bar Section</a>"#),
+            "anchor with label: {html}"
+        );
+
+        let cross = render(
+            "[[otherproj:notes/x#heading]] [[_global:python-env?v=1#setup|Setup]]",
+            "default",
+            "scratch",
+        );
+        assert!(
+            cross.contains(
+                r#"href="w/default/otherproj/p/notes/x.md#heading">otherproj:notes/x#heading</a>"#
+            ),
+            "cross-project anchor: {cross}"
+        );
+        assert!(
+            cross.contains(r#"href="w/default/_global/p/python-env.md?v=1#setup">Setup</a>"#),
+            "global scope query and anchor: {cross}"
+        );
+    }
+
+    #[test]
+    fn wikilink_suffix_with_space_or_parenthesis_stays_one_link() {
+        let html = render(
+            "[[notes/foo#my section]] and [[notes/foo#a)b]]",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md#my%20section">"#),
+            "space in anchor: {html}"
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md#a%29b">"#),
+            "parenthesis in anchor: {html}"
+        );
+        assert!(
+            !html.contains("b)"),
+            "a ')' must not close the link early: {html}"
+        );
+        assert!(
+            !html.contains("[["),
+            "both wikilinks render as links: {html}"
+        );
+    }
+
+    #[test]
     fn wikilink_cross_project_and_cross_workspace_scope() {
         let html = render(
             "[[otherproj:notes/x]] [[ws2/proj2:y]]",
@@ -617,6 +1039,27 @@ mod tests {
     }
 
     #[test]
+    fn wikilink_global_scope_pins_to_default_workspace() {
+        let html = render("see [[_global:python-env]] here", "other", "embodied-ai");
+        assert!(
+            html.contains(r#"href="w/default/_global/p/python-env.md""#),
+            "project-only _global from another workspace: {html}"
+        );
+
+        let html = render("[[machine:notes/x]]", "other", "embodied-ai");
+        assert!(
+            html.contains(r#"href="w/other/machine/p/notes/x.md""#),
+            "non-global project-only stays on the source workspace: {html}"
+        );
+
+        let html = render("[[other/_global:notes/x]]", "default", "scratch");
+        assert!(
+            html.contains(r#"href="w/other/_global/p/notes/x.md""#),
+            "explicit workspace is kept: {html}"
+        );
+    }
+
+    #[test]
     fn wikilink_not_linkified_in_code() {
         let fenced = render("```\n[[notes/foo]]\n```", "default", "scratch");
         assert!(!fenced.contains("<a href"), "fenced: {fenced}");
@@ -624,6 +1067,30 @@ mod tests {
 
         let inline = render("use `[[notes/foo]]` literally", "default", "scratch");
         assert!(!inline.contains("<a href"), "inline code: {inline}");
+    }
+
+    /// An HTML block renders as its escaped source, so a wikilink in it
+    /// has to stay as written rather than turn into rewritten link markup.
+    #[test]
+    fn wikilink_kept_as_written_in_html_block() {
+        let comment = render("<!-- see [[notes/foo]] -->", "default", "scratch");
+        assert!(comment.contains("see [[notes/foo]]"), "comment: {comment}");
+        assert!(!comment.contains("/p/notes/foo.md"), "comment: {comment}");
+
+        let div = render("<div>\n[[notes/foo|Foo]]\n</div>", "default", "scratch");
+        assert!(div.contains("[[notes/foo|Foo]]"), "div: {div}");
+
+        // Inline HTML is only the tag itself; the text around it is still
+        // a paragraph, and so is the paragraph after the block.
+        let inline = render(
+            "<div>x</div>\n\ntext <span>[[notes/foo]]</span>",
+            "default",
+            "scratch",
+        );
+        assert!(
+            inline.contains(r#"<a href="w/default/scratch/p/notes/foo.md">notes/foo</a>"#),
+            "inline: {inline}"
+        );
     }
 
     #[test]
@@ -681,6 +1148,43 @@ mod tests {
             !html.contains(r#"href="w/default/scratch/p/notes/foo.md""#),
             "must NOT linkify inside indented code: {html}"
         );
+    }
+
+    /// Four spaces of indent make a code block only where CommonMark says
+    /// so. A nested list item written with four spaces, and a paragraph's
+    /// continuation line, are text: the engine's link extractor indexes the
+    /// wikilink on them, so the page has to render it as a link too.
+    #[test]
+    fn wikilink_on_an_indented_line_that_is_not_code_is_linkified() {
+        let nested = render(
+            "- Decisions:\n    - see [[decisions/auth]]\n",
+            "default",
+            "scratch",
+        );
+        assert!(
+            nested.contains(r#"href="w/default/scratch/p/decisions/auth.md""#),
+            "nested list item: {nested}"
+        );
+        assert!(!nested.contains("<pre>"), "not a code block: {nested}");
+
+        let continued = render(
+            "The flow is described\n    in [[notes/flow]] and nowhere else.\n",
+            "default",
+            "scratch",
+        );
+        assert!(
+            continued.contains(r#"href="w/default/scratch/p/notes/flow.md""#),
+            "paragraph continuation: {continued}"
+        );
+
+        // Indented code inside a list item is still code, and stays literal.
+        let code = render(
+            "- step\n\n        run [[notes/foo]]\n",
+            "default",
+            "scratch",
+        );
+        assert!(code.contains("[[notes/foo]]"), "list code literal: {code}");
+        assert!(!code.contains("<a href"), "list code not linkified: {code}");
     }
 
     /// A label that contains `(` or `)` must not let the next `)` close
@@ -754,5 +1258,145 @@ mod tests {
                 "{raw} must stay literal, got: {html}"
             );
         }
+    }
+
+    #[test]
+    fn relative_link_with_leading_dot_slash_resolves() {
+        let html = render(
+            "[doc](./notes/foo.md) and [pointy](<./notes/bar.md>)",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md""#),
+            "leading ./ must be stripped: {html}"
+        );
+        // The parser hands back a `<…>` destination without its brackets, so
+        // only the `./` needs handling here.
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/bar.md""#),
+            "pointy brackets and leading ./ must resolve: {html}"
+        );
+    }
+
+    #[test]
+    fn relative_link_with_leading_dot_slash_never_yields_an_empty_segment() {
+        let html = render("[a](.//x.md) and [b](././y.md)", "default", "scratch");
+        assert!(!html.contains("p//"), "empty path segment: {html}");
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/y.md""#),
+            "repeated ./ must be stripped: {html}"
+        );
+    }
+
+    #[test]
+    fn heading_ids_are_emitted_for_all_levels() {
+        let md = "# Level 1\n\n## Level 2\n\n### Level 3\n\n#### Level 4\n\n##### Level 5\n\n###### Level 6";
+        let html = render(md, "default", "scratch");
+        assert!(html.contains(r#"<h1 id="level-1">Level 1</h1>"#), "{html}");
+        assert!(html.contains(r#"<h2 id="level-2">Level 2</h2>"#), "{html}");
+        assert!(html.contains(r#"<h3 id="level-3">Level 3</h3>"#), "{html}");
+        assert!(html.contains(r#"<h4 id="level-4">Level 4</h4>"#), "{html}");
+        assert!(html.contains(r#"<h5 id="level-5">Level 5</h5>"#), "{html}");
+        assert!(html.contains(r#"<h6 id="level-6">Level 6</h6>"#), "{html}");
+    }
+
+    #[test]
+    fn heading_ids_strip_punctuation_and_normalize_dashes() {
+        let md = "## What \"deleted\" means: purge & destroy?\n\n### Scenario D — menu bar app\n\n#### 1. Introduction (v1.0)";
+        let html = render(md, "default", "scratch");
+        assert!(
+            html.contains(r#"<h2 id="what-deleted-means-purge-destroy">"#),
+            "punctuation and symbols: {html}"
+        );
+        assert!(
+            html.contains(r#"<h3 id="scenario-d-menu-bar-app">"#),
+            "em dash: {html}"
+        );
+        assert!(
+            html.contains(r#"<h4 id="1-introduction-v10">"#),
+            "numbered heading: {html}"
+        );
+    }
+
+    #[test]
+    fn heading_ids_with_formatting_and_code() {
+        let md = "## Hello **bold** and `code` span";
+        let html = render(md, "default", "scratch");
+        assert!(
+            html.contains(
+                r#"<h2 id="hello-bold-and-code-span">Hello <strong>bold</strong> and <code>code</code> span</h2>"#
+            ),
+            "inline formatting: {html}"
+        );
+    }
+
+    #[test]
+    fn duplicate_headings_disambiguate_with_suffixes() {
+        let md = "## Context\n\n## Context\n\n## Context 1\n\n## Context";
+        let html = render(md, "default", "scratch");
+        assert!(html.contains(r#"<h2 id="context">Context</h2>"#), "{html}");
+        assert!(
+            html.contains(r#"<h2 id="context-1">Context</h2>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<h2 id="context-1-1">Context 1</h2>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<h2 id="context-2">Context</h2>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn empty_or_punctuation_only_headings_fall_back_to_section() {
+        let md = "## ???\n\n## !!!";
+        let html = render(md, "default", "scratch");
+        assert!(html.contains(r#"<h2 id="section">???</h2>"#), "{html}");
+        assert!(html.contains(r#"<h2 id="section-1">!!!</h2>"#), "{html}");
+    }
+
+    #[test]
+    fn heading_with_raw_html_and_quotes_escapes_markup_and_keeps_id_slug_safe() {
+        let md = "## <img src=x onerror=alert(1)> \"q\"";
+        let html = render(md, "default", "scratch");
+        assert!(
+            !html.contains("<img"),
+            "raw heading HTML must not survive as markup: {html}"
+        );
+        // Smart punctuation renders the quotes as “q”; the HTML payload must
+        // stay escaped text inside the heading.
+        assert!(
+            html.contains(r#"<h2 id="q">&lt;img src=x onerror=alert(1)&gt; “q”</h2>"#),
+            "the heading must render escaped text with a slug id: {html}"
+        );
+        let id = html
+            .split("id=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("no heading id emitted: {html}"));
+        assert!(
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
+            "heading id must match ^[a-z0-9_-]+$, got: {id}"
+        );
+    }
+
+    #[test]
+    fn wikilink_anchor_matches_generated_heading_id() {
+        let md = "Jump to [[notes/foo#my-section|My Section]]\n\n## My Section";
+        let html = render(md, "default", "scratch");
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md#my-section">My Section</a>"#),
+            "link href: {html}"
+        );
+        assert!(
+            html.contains(r#"<h2 id="my-section">My Section</h2>"#),
+            "heading id: {html}"
+        );
     }
 }

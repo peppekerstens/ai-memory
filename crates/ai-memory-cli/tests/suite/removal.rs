@@ -45,7 +45,16 @@ fn command_with_home(home: &Path) -> Command {
         .env_remove("KIRO_HOME")
         // Keep Claude installer/removal tests inside their temp HOME unless a
         // test explicitly opts into a relocated config root.
-        .env_remove("CLAUDE_CONFIG_DIR");
+        .env_remove("CLAUDE_CONFIG_DIR")
+        // Codex's hooks.json and MCP config.toml both follow CODEX_HOME, and
+        // uninstall also resolves Grok, Pi and OMP targets from their own
+        // variables, so none of them may point outside the sandbox.
+        .env_remove("CODEX_HOME")
+        .env_remove("GROK_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("OMP_PROFILE")
+        .env_remove("PI_PROFILE")
+        .env_remove("PI_CONFIG_DIR");
     command
 }
 
@@ -124,6 +133,217 @@ fn install_then_uninstall_round_trip_claude_hooks() {
             "{ours} should be removed"
         );
     }
+}
+
+/// `--scope project` writes the checkout's gitignored
+/// `.claude/settings.local.json` (at the git root from any subdirectory; in
+/// the launch directory on Windows) and leaves the user-level file alone, and
+/// keeps its backup out of the checkout. `uninstall` from inside the checkout
+/// sweeps exactly our entries; from anywhere else it leaves the file untouched.
+#[test]
+fn project_scope_install_then_uninstall_round_trip_claude_hooks() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git init failed");
+    let sub = project.path().join("crates").join("x");
+    std::fs::create_dir_all(&sub).unwrap();
+    // Claude Code reads the launch directory on Windows, the git root elsewhere.
+    let local = if cfg!(windows) {
+        sub.as_path()
+    } else {
+        project.path()
+    }
+    .join(".claude")
+    .join("settings.local.json");
+    // Pre-seed a third-party hook we must NOT touch.
+    write_file(
+        &local,
+        r#"{"hooks":{"Notification":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/n.sh"}]}]}}"#,
+    );
+    let install = |cwd: &Path| {
+        command_with_home(home.path())
+            .args([
+                "install-hooks",
+                "--agent",
+                "claude-code",
+                "--scope",
+                "project",
+                "--apply",
+            ])
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    };
+
+    let output = install(&sub);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "install-hooks failed: {stderr}");
+    assert!(
+        stderr.contains("is not ignored by git"),
+        "no ignore rule exists yet, so the installer must warn: {stderr}"
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+    assert!(
+        after["hooks"]["Notification"].is_array(),
+        "third-party hook must survive"
+    );
+    assert!(
+        after["hooks"]["SessionStart"].is_array(),
+        "our hooks must land in the project file: {after}"
+    );
+    assert!(
+        !home.path().join(".claude").join("settings.json").exists(),
+        "project scope must not touch the user-level settings"
+    );
+    // The pre-seeded file was updated, so a backup exists, and it must sit
+    // under the data dir: Claude Code's ignore rule does not cover a sibling
+    // `.bak-<ts>`, which would carry the hook commands into `git status`.
+    let backups = home
+        .path()
+        .join(".ai-memory-data")
+        .join("backups")
+        .join("claude-settings-local");
+    let no_backup_in_checkout = |when: &str| {
+        let leaked: Vec<_> = std::fs::read_dir(local.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".bak-"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{when}: backup left in the checkout: {leaked:?}"
+        );
+    };
+    no_backup_in_checkout("install");
+    let saved: Vec<_> = std::fs::read_dir(&backups).unwrap().flatten().collect();
+    assert_eq!(saved.len(), 1, "one backup under {}", backups.display());
+    assert!(
+        std::fs::read_to_string(saved[0].path())
+            .unwrap()
+            .contains("/usr/bin/n.sh"),
+        "the backup holds the prior file"
+    );
+
+    // With an ignore rule in place the warning goes away.
+    write_file(
+        &project.path().join(".gitignore"),
+        "**/.claude/settings.local.json\n",
+    );
+    let output = install(&sub);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "re-apply failed: {stderr}");
+    assert!(!stderr.contains("is not ignored by git"), "{stderr}");
+
+    // Uninstall from an unrelated directory never reaches into this checkout.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let output = run_uninstall(
+        elsewhere.path(),
+        home.path(),
+        &["uninstall", "--apply", "--only", "hooks", "--yes"],
+    );
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let untouched: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+    assert!(
+        untouched["hooks"]["SessionStart"].is_array(),
+        "uninstall elsewhere must leave the project file alone"
+    );
+
+    // From inside the checkout (any subdirectory) it sweeps exactly our entries.
+    let output = run_uninstall(
+        &sub,
+        home.path(),
+        &["uninstall", "--apply", "--only", "hooks", "--yes"],
+    );
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    no_backup_in_checkout("uninstall");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("used `install-hooks --scope project`"),
+        "uninstall must point at the checkouts it cannot reach"
+    );
+    let swept: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+    assert!(
+        swept["hooks"]["Notification"].is_array(),
+        "third-party hook must survive uninstall"
+    );
+    for ours in [
+        "SessionStart",
+        "SessionEnd",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "PreCompact",
+        "UserPromptSubmit",
+    ] {
+        assert!(
+            swept["hooks"].get(ours).is_none(),
+            "{ours} should be removed: {swept}"
+        );
+    }
+}
+
+/// A print-only preview of a project-scoped install must not hand the operator
+/// a bearer to paste into the checkout; the user-level preview still embeds it.
+#[test]
+fn project_scope_preview_withholds_the_bearer_token() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let preview = |scope: &str| {
+        let output = command_with_home(home.path())
+            .args([
+                "install-hooks",
+                "--agent",
+                "claude-code",
+                "--scope",
+                scope,
+                "--auth-token",
+                "SEKRIT-PREVIEW",
+            ])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "preview failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let project_scoped = preview("project");
+    assert!(
+        !project_scoped.contains("SEKRIT-PREVIEW"),
+        "the project preview must not embed the bearer: {project_scoped}"
+    );
+    assert!(project_scoped.contains("NOT embedded"), "{project_scoped}");
+
+    let global = preview("global");
+    assert!(
+        global.contains("SEKRIT-PREVIEW"),
+        "control: the user-level preview embeds it as before: {global}"
+    );
+    assert!(
+        !home.path().join(".claude").exists() && !project.path().join(".claude").exists(),
+        "a preview writes nothing"
+    );
 }
 
 #[test]
@@ -221,6 +441,141 @@ fn relocated_claude_uninstall_sweeps_active_and_legacy_installs() {
             );
         }
     }
+}
+
+/// Older installs wrote the Codex MCP entry to `~/.codex/config.toml` even with
+/// `CODEX_HOME` set. A relocated install now lands in `$CODEX_HOME/config.toml`,
+/// and uninstall sweeps both.
+#[test]
+fn relocated_codex_uninstall_sweeps_active_and_legacy_mcp() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let relocated = home.path().join("codex-work");
+    std::fs::create_dir_all(&relocated).unwrap();
+
+    let run = |relocate: bool, args: &[&str]| {
+        let mut command = command_with_home(home.path());
+        if relocate {
+            command.env("CODEX_HOME", &relocated);
+        }
+        command
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+
+    for relocate in [false, true] {
+        let output = run(relocate, &["install-mcp", "--client", "codex", "--apply"]);
+        assert!(
+            output.status.success(),
+            "install failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let legacy = home.path().join(".codex/config.toml");
+    let active = relocated.join("config.toml");
+    for path in [&legacy, &active] {
+        let content = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("installer did not create {}: {error}", path.display()));
+        assert!(
+            content.contains("ai-memory"),
+            "Codex MCP entry missing in {}: {content}",
+            path.display()
+        );
+    }
+
+    let output = run(true, &["uninstall", "--only", "mcp", "--apply", "--yes"]);
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for path in [&legacy, &active] {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.contains("ai-memory"),
+            "Codex MCP entry survived in {}: {content}",
+            path.display()
+        );
+    }
+}
+
+/// `PI_CONFIG_DIR` renames OMP's `~/.omp` root for the extension and
+/// `mcp.json` (an XDG data dir moves only sessions), and uninstall also sweeps
+/// the `~/.omp` locations earlier releases wrote whatever the variable said.
+#[test]
+fn omp_install_and_uninstall_follow_pi_config_dir() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let xdg_omp = home.path().join(".local/share/omp");
+    std::fs::create_dir_all(&xdg_omp).unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .env("PI_CONFIG_DIR", ".omp-alt")
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&["install-mcp", "--client", "omp", "--apply"]);
+    run(&[
+        "install-hooks",
+        "--agent",
+        "omp",
+        "--apply",
+        "--server-url",
+        "http://127.0.0.1:49374",
+    ]);
+    let renamed = home.path().join(".omp-alt/agent");
+    let mcp = renamed.join("mcp.json");
+    let extension = renamed.join("extensions/ai-memory-omp.ts");
+    assert!(std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")));
+    assert!(extension.exists(), "{}", extension.display());
+    assert!(
+        std::fs::read_dir(&xdg_omp).unwrap().next().is_none(),
+        "XDG never receives the extension or mcp.json"
+    );
+    assert!(!home.path().join(".omp").exists());
+
+    // What an earlier release left under ~/.omp, which ignored PI_CONFIG_DIR.
+    let generated = "// Auto-generated by `ai-memory install-hooks --agent omp --apply`.\nconst AGENT = \"omp\";\n";
+    let legacy = [
+        home.path().join(".omp/agent/extensions/ai-memory-omp.ts"),
+        home.path()
+            .join(".omp/profiles/work/agent/extensions/ai-memory-omp.ts"),
+    ];
+    for path in &legacy {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, generated).unwrap();
+    }
+
+    run(&[
+        "uninstall",
+        "--only",
+        "hooks",
+        "--profile",
+        "work",
+        "--apply",
+        "--yes",
+    ]);
+    run(&["uninstall", "--only", "mcp", "--apply", "--yes"]);
+    for path in legacy.iter().chain([&extension]) {
+        assert!(
+            !path.exists(),
+            "OMP extension survived at {}",
+            path.display()
+        );
+    }
+    assert!(!std::fs::read_to_string(&mcp).unwrap().contains("ai-memory"));
 }
 
 #[test]
@@ -366,6 +721,128 @@ fn uninstall_omp_extension_deletes_only_generated_file() {
         .unwrap();
     assert!(status.success(), "uninstall failed");
     assert!(!extension.exists(), "generated extension should be deleted");
+}
+
+/// A named OMP profile owns its agent dir, extension and `mcp.json` alike.
+/// Uninstall sweeps it, the default profile's dir (where earlier releases put
+/// the extension whenever `PI_CODING_AGENT_DIR` was set) and `~/.omp/agent`
+/// (where `install-mcp` always wrote the MCP entry).
+#[test]
+fn profiled_omp_uninstall_sweeps_profile_default_and_legacy() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let pcad = home.path().join("pi-family");
+
+    let run = |env: &[(&str, &Path)], args: &[&str]| {
+        let mut command = command_with_home(home.path());
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let output = command
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let work = Path::new("work");
+    let install_hooks = [
+        "install-hooks",
+        "--agent",
+        "omp",
+        "--apply",
+        "--server-url",
+        "http://127.0.0.1:49374",
+    ];
+    let install_mcp = ["install-mcp", "--client", "omp", "--apply"];
+    run(&[], &install_mcp);
+    run(&[("OMP_PROFILE", work)], &install_mcp);
+    run(&[("OMP_PROFILE", work)], &install_hooks);
+    run(&[("PI_CODING_AGENT_DIR", &pcad)], &install_hooks);
+
+    let profile = home.path().join(".omp/profiles/work/agent");
+    let legacy = home.path().join(".omp/agent");
+    let installed = [
+        legacy.join("mcp.json"),
+        profile.join("mcp.json"),
+        profile.join("extensions/ai-memory-omp.ts"),
+        pcad.join("extensions/ai-memory-omp.ts"),
+    ];
+    for path in &installed {
+        let content = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("installer did not create {}: {error}", path.display()));
+        assert!(content.contains("ai-memory"), "{}", path.display());
+    }
+
+    let env: &[(&str, &Path)] = &[("OMP_PROFILE", work), ("PI_CODING_AGENT_DIR", &pcad)];
+    run(env, &["uninstall", "--only", "hooks", "--apply", "--yes"]);
+    run(env, &["uninstall", "--only", "mcp", "--apply", "--yes"]);
+    for path in &installed[..2] {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.contains("ai-memory"),
+            "OMP MCP entry survived in {}: {content}",
+            path.display()
+        );
+    }
+    for path in &installed[2..] {
+        assert!(
+            !path.exists(),
+            "OMP extension survived at {}",
+            path.display()
+        );
+    }
+}
+
+/// A profile name OMP refuses must not abort the cleanup of every other
+/// agent: uninstall warns, skips that profile and sweeps the rest.
+#[test]
+fn uninstall_survives_an_invalid_omp_profile() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let claude = home.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let settings = claude.join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/stop.sh"}]}]}}"#,
+    )
+    .unwrap();
+    let extensions = home.path().join(".omp/agent/extensions");
+    std::fs::create_dir_all(&extensions).unwrap();
+    let extension = extensions.join("ai-memory-omp.ts");
+    std::fs::write(
+        &extension,
+        "// Auto-generated by `ai-memory install-hooks --agent omp --apply`.\nconst AGENT = \"omp\";\n",
+    )
+    .unwrap();
+
+    let output = command_with_home(home.path())
+        .env("OMP_PROFILE", "Work")
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "uninstall failed: {stderr}");
+    assert!(
+        stderr.contains("skipping the active OMP profile"),
+        "the invalid profile must be reported: {stderr}"
+    );
+    assert!(
+        !std::fs::read_to_string(&settings)
+            .unwrap()
+            .contains("AI_MEMORY_HOOK_URL"),
+        "the Claude hook must still be removed"
+    );
+    assert!(
+        !extension.exists(),
+        "the default OMP extension must be swept"
+    );
 }
 
 #[test]
@@ -943,9 +1420,12 @@ fn uninstall_dry_run_previews_purge() {
     }
 }
 
-/// Best-effort, NOT in the default run (sysinfo reads the real process table;
-/// no injection seam). Spawns a real sibling `ai-memory` process and asserts
-/// `--purge-data` refuses up front, leaving the wiring intact. Run with:
+/// Best-effort, NOT in the default run (sysinfo reads the real process
+/// table). Spawns a REAL sibling `ai-memory` process — as opposed to the
+/// `AI_MEMORY_TEST_FORCE_SIBLING_PIDS` injection seam the tests below use —
+/// so the actual sysinfo scan itself stays covered, not just the refusal
+/// logic downstream of it. Asserts `--purge-data` refuses up front, leaving
+/// the wiring intact. Run with:
 /// `cargo test -p ai-memory-cli --test removal -- --ignored`.
 #[test]
 #[ignore]
@@ -986,6 +1466,273 @@ fn purge_data_refuses_when_sibling_alive() {
         original,
         "no wiring should be removed when the purge is refused up front"
     );
+}
+
+// ----------------------------------------------------------------
+// Process-guard injection seam (`AI_MEMORY_TEST_FORCE_SIBLING_PIDS`).
+//
+// `process_guard::sibling_processes()` normally either does a real sysinfo
+// scan, or (only under `cfg!(test)` / `AI_MEMORY_TEST_NO_PROCESS_GUARD`)
+// short-circuits to "no siblings" — which made the guard's REFUSAL branch
+// untestable from an in-process test and left `purge_data_refuses_when_
+// sibling_alive` above `#[ignore]`d, needing a real spawned sibling. These
+// tests exercise the refusal deterministically via the injection seam,
+// against every direct-disk lifecycle command the guard protects: `reset`,
+// `restore`, `reindex`, and `uninstall --purge-data`.
+// ----------------------------------------------------------------
+
+/// `reset --confirm` refuses while a sibling is reported alive, and leaves
+/// the data dir completely untouched.
+#[test]
+fn reset_refuses_when_sibling_pid_is_injected() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+
+    let out = command_with_home(home.path())
+        .args(["reset", "--confirm"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "424242")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "should refuse while a sibling is alive"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to reset") && stderr.contains("424242"),
+        "stderr was: {stderr}"
+    );
+    for sub in ["wiki", "db", "raw"] {
+        assert!(
+            data.path().join(sub).join("f.txt").exists(),
+            "{sub}/f.txt must survive a refused reset"
+        );
+    }
+}
+
+/// The control: an explicitly EMPTY injected sibling list must not block a
+/// legitimate `reset --confirm`.
+#[test]
+fn reset_proceeds_when_injected_sibling_list_is_empty() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+
+    let out = command_with_home(home.path())
+        .args(["reset", "--confirm"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for sub in ["wiki", "db", "raw"] {
+        assert!(
+            !data.path().join(sub).join("f.txt").exists(),
+            "{sub} must be wiped once the guard reports no siblings"
+        );
+    }
+}
+
+/// `restore --from` refuses while a sibling is reported alive, before ever
+/// checking whether the source tarball exists.
+#[test]
+fn restore_refuses_when_sibling_pid_is_injected() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    let out = command_with_home(home.path())
+        .args(["restore", "--from", "/does/not/exist.tar.gz"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "424242")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "should refuse while a sibling is alive"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to restore") && stderr.contains("424242"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not found"),
+        "the guard must refuse BEFORE the missing-tarball check runs: {stderr}"
+    );
+}
+
+/// The control: an explicitly EMPTY injected sibling list lets `restore` past
+/// the guard — it then fails on the next check (missing tarball) instead of
+/// the busy message, proving the guard itself is not what stopped it.
+#[test]
+fn restore_proceeds_when_injected_sibling_list_is_empty() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    let out = command_with_home(home.path())
+        .args(["restore", "--from", "/does/not/exist.tar.gz"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "")
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "still fails, but past the guard");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not found"),
+        "expected the missing-tarball error once no sibling is reported: {stderr}"
+    );
+    assert!(
+        !stderr.contains("refusing to restore"),
+        "stderr was: {stderr}"
+    );
+}
+
+/// `reindex` refuses while a sibling is reported alive, before ever opening
+/// the SQLite store.
+#[test]
+fn reindex_refuses_when_sibling_pid_is_injected() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("wiki")).unwrap();
+
+    let out = command_with_home(home.path())
+        .args(["reindex"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "424242")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "should refuse while a sibling is alive"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to reindex") && stderr.contains("424242"),
+        "stderr was: {stderr}"
+    );
+    // Nothing should have been created; the guard runs before `Store::open`.
+    assert!(
+        !data.path().join("db").join("memory.sqlite").exists(),
+        "the guard must refuse before the store is opened/created"
+    );
+}
+
+/// The control: an explicitly EMPTY injected sibling list lets `reindex`
+/// proceed and actually rebuild the (empty) index.
+#[test]
+fn reindex_proceeds_when_injected_sibling_list_is_empty() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("wiki")).unwrap();
+
+    let out = command_with_home(home.path())
+        .args(["reindex"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        data.path().join("db").join("memory.sqlite").exists(),
+        "reindex must have opened/created the store once no sibling is reported"
+    );
+}
+
+/// `uninstall --purge-data` refuses while a sibling is reported alive, and
+/// leaves the data dir untouched — the sibling of the ignored real-process
+/// test above, but deterministic and in the default run.
+#[test]
+fn uninstall_purge_data_refuses_when_sibling_pid_is_injected() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+
+    let out = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes", "--purge-data"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "424242")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "should refuse while a sibling is alive"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to purge data") && stderr.contains("424242"),
+        "stderr was: {stderr}"
+    );
+    for sub in ["wiki", "db", "raw"] {
+        assert!(
+            data.path().join(sub).join("f.txt").exists(),
+            "{sub}/f.txt must survive a refused purge"
+        );
+    }
+}
+
+/// The control: an explicitly EMPTY injected sibling list must not block a
+/// legitimate `uninstall --apply --yes --purge-data`.
+#[test]
+fn uninstall_purge_data_proceeds_when_injected_sibling_list_is_empty() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+
+    let out = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes", "--purge-data"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for sub in ["wiki", "db", "raw"] {
+        assert!(
+            !data.path().join(sub).join("f.txt").exists(),
+            "{sub} must be purged once the guard reports no siblings"
+        );
+    }
 }
 
 #[test]
@@ -1377,4 +2124,116 @@ fn default_uninstall_removes_installed_kimi_code_flavored_url() {
         "the exact flavored URL install-mcp writes must be removed"
     );
     assert!(after["mcpServers"].get("other").is_some());
+}
+
+/// `ai-memory run` skips auto-wire while its sentinel exists, so an uninstall
+/// that leaves one makes the next managed launch skip wiring and capture
+/// nothing. Hooks or MCP in scope clear every sentinel, even with no other
+/// wiring left; instructions and skills leave them alone.
+#[test]
+fn uninstall_clears_autowire_sentinels_with_hooks_or_mcp() {
+    let _guard = cli_test_lock();
+    for only in [
+        None,
+        Some("hooks"),
+        Some("mcp"),
+        Some("instructions"),
+        Some("skills"),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let state = home.path().join(".ai-memory-data/autowire-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let sentinels = [
+            state.join(format!(
+                "claude-code-{}-0123456789abcdef",
+                env!("CARGO_PKG_VERSION")
+            )),
+            // An older release's name, before the location hash.
+            state.join("codex-2.3.1"),
+        ];
+        for path in &sentinels {
+            std::fs::write(path, b"").unwrap();
+        }
+        let foreign = state.join("notes.txt");
+        std::fs::write(&foreign, "not a sentinel").unwrap();
+        let clears = matches!(only, None | Some("hooks" | "mcp"));
+        let uninstall = |extra: &[&str]| {
+            let mut args = vec!["uninstall"];
+            if let Some(only) = only {
+                args.extend(["--only", only]);
+            }
+            args.extend_from_slice(extra);
+            let output = command_with_home(home.path())
+                .args(&args)
+                .current_dir(project.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let plan = uninstall(&[]);
+        assert_eq!(
+            plan.contains("auto-wire sentinel"),
+            clears,
+            "{only:?}: {plan}"
+        );
+        assert!(
+            sentinels.iter().all(|path| path.exists()),
+            "a dry run must not delete"
+        );
+        uninstall(&["--apply", "--yes"]);
+        for path in &sentinels {
+            assert_eq!(path.exists(), !clears, "{only:?}: {}", path.display());
+        }
+        assert!(
+            foreign.exists(),
+            "a file auto-wire did not write must survive"
+        );
+    }
+}
+
+/// The stored hook bearer is read by the hooks, so only an uninstall that
+/// removes them may delete it.
+#[test]
+fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&["install-mcp", "--client", "claude-code", "--apply"]);
+    run(&["install-hooks", "--agent", "claude-code", "--apply"]);
+    let data = home.path().join(".ai-memory-data");
+    let bearer = [data.join("auth-token"), data.join("auth-header")];
+    for path in &bearer {
+        std::fs::write(path, "secret\n").unwrap();
+    }
+
+    run(&["uninstall", "--only", "mcp", "--apply", "--yes"]);
+    for path in &bearer {
+        assert!(path.exists(), "--only mcp removed {}", path.display());
+    }
+    run(&["uninstall", "--only", "hooks", "--apply", "--yes"]);
+    for path in &bearer {
+        assert!(
+            !path.exists(),
+            "removing the hooks keeps {}",
+            path.display()
+        );
+    }
 }

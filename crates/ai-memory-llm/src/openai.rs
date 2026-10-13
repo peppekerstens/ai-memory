@@ -30,6 +30,16 @@ pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 /// messages and logs — naming it makes those messages discoverable.
 pub(crate) const STRUCTURED_OUTPUT_SCHEMA_NAME: &str = "Result";
 
+/// `X-Request-Id` header the `openai-compat` provider sends on every chat
+/// attempt, carrying the [`LlmOperationId`] all attempts of one operation
+/// share (strict-to-tolerant fallbacks included). A gateway that records it
+/// (for example as `req=<id>`) can correlate every attempt of the same
+/// operation and forward it to the engine. The factory enables it only for
+/// the configured `openai-compat` provider and refuses a static
+/// `AI_MEMORY_LLM_HEADERS` entry for this name there; the official OpenAI
+/// and OpenCode providers keep their own contracts.
+pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
+
 /// Build the full URL for an OpenAI-style endpoint. Tolerates the
 /// conventions found in the wild:
 ///   * `https://api.openai.com`           (OpenAI's own docs)
@@ -65,7 +75,7 @@ fn last_segment_is_version(url: &str) -> bool {
 ///
 /// `Official` targets `api.openai.com` and honours the model-family
 /// rules that the real OpenAI Chat Completions endpoint enforces:
-/// `max_completion_tokens` for gpt-5 / o-series, model-family output
+/// `max_completion_tokens` for gpt-5 / gpt-6 / o-series, model-family output
 /// caps, omitted `temperature` for reasoning models, strict-mode JSON
 /// schema normalisation.
 ///
@@ -101,6 +111,11 @@ pub struct OpenAiProvider {
     /// Caller-identifying defaults a provider opts into. Layered *under*
     /// `extra_headers`.
     client_headers: Option<ClientHeaders>,
+    /// OpenAI-compat only: send [`REQUEST_ID_HEADER`] with the logical
+    /// operation id on every chat attempt. Off by default; the factory
+    /// turns it on only for the configured `openai-compat` provider, so
+    /// the official OpenAI and OpenCode providers never gain the header.
+    request_id_header: bool,
 }
 
 /// Defaults for a provider whose gateway wants the caller identified: an
@@ -130,6 +145,7 @@ impl OpenAiProvider {
             reasoning_effort: None,
             extra_headers: ExtraHeaders::default(),
             client_headers: None,
+            request_id_header: false,
         })
     }
 
@@ -195,6 +211,20 @@ impl OpenAiProvider {
             user_agent,
             operation_id,
         });
+        self
+    }
+
+    /// Send [`REQUEST_ID_HEADER`] with the logical operation id on every
+    /// chat attempt. The id is created before the first attempt and reused
+    /// by every fallback, so all attempts of one operation carry exactly
+    /// the same value. Enabled by the factory only for the configured
+    /// `openai-compat` provider; a static `AI_MEMORY_LLM_HEADERS` entry
+    /// for this name is refused there at startup, and
+    /// [`ExtraHeaders::apply`] replaces per name either way, so one value
+    /// always reaches the wire.
+    #[must_use]
+    pub(crate) fn with_request_id_header(mut self) -> Self {
+        self.request_id_header = true;
         self
     }
 
@@ -388,7 +418,7 @@ impl OpenAiProvider {
                 } else {
                     (Some(capped), None)
                 };
-                // gpt-5 and o-series reject any non-default temperature
+                // gpt-5, gpt-6 and o-series reject any non-default temperature
                 // with `Unsupported value: temperature does not support
                 // 0.2 with this model. Only the default (1) is
                 // supported.` The lint / consolidate / bootstrap call
@@ -462,9 +492,23 @@ impl OpenAiProvider {
         // — two `user-agent` values whenever the operator configures one, and
         // a duplicate is worse than either value alone. `set_default` leaves
         // an operator entry untouched, so the layering is explicit here
-        // rather than dependent on call order.
+        // rather than dependent on call order. The dynamic `x-request-id`
+        // is the one header ai-memory *owns* on this path: `insert`
+        // (not `set_default`) plus the factory's refuse-up-front keep
+        // exactly one value on the wire, the operation's.
         let request = match self.client_headers {
-            None => self.extra_headers.apply(builder),
+            None => {
+                let mut headers = self.extra_headers.clone();
+                if self.request_id_header {
+                    // A UUID is always a valid header value; on the
+                    // impossible failure, omitting a correlation header
+                    // beats failing the consolidation pass that carries it.
+                    if let Ok(value) = HeaderValue::from_str(&operation_id.to_string()) {
+                        headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+                    }
+                }
+                headers.apply(builder)
+            }
             Some(client) => {
                 let mut headers = self.extra_headers.clone();
                 headers.set_default(
@@ -576,17 +620,21 @@ pub(crate) fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
 
 /// Models that require `max_completion_tokens` instead of `max_tokens`.
 /// OpenAI introduced this rename starting with the reasoning-capable o1
-/// family and made it mandatory across the gpt-5 line. Sending the legacy
+/// family and made it mandatory across the gpt-5 and gpt-6 lines. Sending the legacy
 /// `max_tokens` to these models returns a 400 with
 /// `Unsupported parameter: 'max_tokens'`.
 fn model_requires_max_completion_tokens(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+    m.starts_with("gpt-5")
+        || m.starts_with("gpt-6")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
 }
 
 /// Models that reject any non-default `temperature` value.
 ///
-/// gpt-5 and the o-series reasoning models accept only the model
+/// gpt-5, gpt-6 and the o-series reasoning models accept only the model
 /// default (1.0). Any caller-supplied value — including the 0.1-0.2
 /// passed by lint / bootstrap / consolidation — returns a 400:
 /// `Unsupported value: 'temperature' does not support 0.2 with this
@@ -653,12 +701,12 @@ impl ReasoningHost {
 /// model-specific message — at which point the operator can lower
 /// `max_tokens` or switch model. The cap exists to unblock the
 /// common case (gpt-4o family at 16384), not to paper over every
-/// model. Reasoning models in the gpt-5 / o-series have much larger
+/// model. Reasoning models in the gpt-5 / gpt-6 / o-series have much larger
 /// caps (128K+), so we leave their requests untouched.
 fn max_output_tokens_for(model: &str) -> u32 {
     if model_requires_max_completion_tokens(model) {
-        // gpt-5 / o-series: documented at 128K output. Leave the
-        // caller's value alone — they know what they're asking for.
+        // gpt-5 / o-series: documented at 128K output; gpt-6 gets the
+        // same handling. Leave the caller's value alone — they know what they're asking for.
         u32::MAX
     } else {
         // gpt-4o family published cap. gpt-4-turbo / gpt-3.5 have a
@@ -671,15 +719,18 @@ fn max_output_tokens_for(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiProvider, RequestDialect, enforce_strict_object_schemas,
+        OpenAiProvider, REQUEST_ID_HEADER, RequestDialect, enforce_strict_object_schemas,
         model_requires_max_completion_tokens, normalize_openai_base,
     };
-    use crate::types::{ChatMessage, ChatRequest, ReasoningEffort, Role};
+    use crate::provider::LlmProvider;
+    use crate::types::{ChatMessage, ChatRequest, LlmOperationId, ReasoningEffort, Role};
     use rstest::rstest;
     use schemars::JsonSchema;
     use secrecy::SecretString;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn provider_for(model: &str) -> OpenAiProvider {
         OpenAiProvider::new(SecretString::new("test-key".into()), model).unwrap()
@@ -1043,6 +1094,7 @@ mod tests {
         assert!(model_requires_max_completion_tokens("o1-mini"));
         assert!(model_requires_max_completion_tokens("o3"));
         assert!(model_requires_max_completion_tokens("o4-mini"));
+        assert!(model_requires_max_completion_tokens("gpt-6-luna"));
     }
 
     #[test]
@@ -1115,6 +1167,25 @@ mod tests {
             json.get("temperature").is_none(),
             "temperature must be omitted for gpt-5/o-series under the Official dialect"
         );
+    }
+
+    #[test]
+    fn build_request_omits_temperature_for_gpt6() {
+        let p = provider_for("gpt-6-luna");
+        let req_input = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "x".into(),
+            }],
+            max_tokens: 64_000,
+            temperature: Some(0.2),
+        };
+        let json = serde_json::to_value(p.build_request(&req_input, None)).unwrap();
+        assert!(json.get("temperature").is_none());
+        assert!(json.get("max_tokens").is_none());
+        // Above the 16,384 cap applied to non-reasoning models.
+        assert_eq!(json["max_completion_tokens"], 64_000);
     }
 
     #[test]
@@ -1331,6 +1402,36 @@ mod tests {
         assert_eq!(
             normalize_openai_base("https://api.z.ai/api/coding/paas/v4", ep),
             "https://api.z.ai/api/coding/paas/v4/embeddings"
+        );
+    }
+
+    /// Acceptance: the official OpenAI provider keeps its contract —
+    /// without the openai-compat opt-in it never sends `x-request-id`.
+    #[tokio::test]
+    async fn the_official_provider_sends_no_request_id_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-4o-mini",
+                "choices": [{ "message": { "content": "ok" } }],
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(SecretString::from("sk-test"), "gpt-4o-mini")
+            .unwrap()
+            .with_base_url(server.uri());
+        provider
+            .complete_with_operation_id(ChatRequest::user_prompt("hi"), LlmOperationId::new())
+            .await
+            .expect("completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].headers.get(REQUEST_ID_HEADER).is_none(),
+            "the official provider must not gain the openai-compat header"
         );
     }
 }

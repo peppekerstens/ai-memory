@@ -1,6 +1,6 @@
 # Security
 
-> The full security model. Moved verbatim from the README front page; the README keeps a summary.
+> The full security model. Moved from the README front page; the README keeps a summary.
 
 Loopback-only (`127.0.0.1:49374`) with no auth is the default because
 it is safe for a single-user laptop: no process outside the machine can
@@ -10,9 +10,9 @@ Unauthenticated non-loopback HTTP now fails closed. Set
 `AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an
 intentional, dangerous exception for plain HTTP only. Authentication does not
 encrypt bearer tokens: for LAN or remote access, use the ready
-[Caddy](docker/compose.tls.caddy.yml) or
-[Cloudflare Tunnel](docker/compose.tls.cloudflared.yml) templates described in
-the [HTTPS reverse-proxy guide](docs/https-via-proxy.md).
+[Caddy](../docker/compose.tls.caddy.yml) or
+[Cloudflare Tunnel](../docker/compose.tls.cloudflared.yml) templates described in
+the [HTTPS reverse-proxy guide](https-via-proxy.md).
 
 Enable bearer auth when the server is exposed beyond loopback, when
 untrusted local processes share the machine, or when the data dir holds
@@ -35,6 +35,15 @@ ai-memory install-hooks --agent  claude-code --apply \
     --server-url "http://<server-ip>:49374" --auth-token "$TOKEN"
 ```
 
+When users must not see each other's projects at all, run separate servers.
+One machine can still capture for several of them: register each server as
+a named profile with `ai-memory server add` and let each repository's
+`.ai-memory.toml` select one with `server = "<name>"`. The marker never holds
+a URL or token, a profile can be restricted to the directories it serves, and
+a selection that does not resolve drops the event instead of sending it to
+another server. See
+[`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
+
 Bearer auth protects `/mcp`, `/hook`, `/handoff`, `/workstream/*`, and
 machine calls to `/admin/*` and `/api/v1/*`. Humans sign in at
 `POST /auth/login`; the console uses an `HttpOnly` session cookie plus CSRF,
@@ -45,6 +54,53 @@ HTTPS reverse proxy owns the browser-facing edge. It makes the session cookie
 HTTPS-only. Close or redirect direct HTTP access to that hostname.
 Non-loopback binds should also set `AI_MEMORY_ALLOWED_HOSTS` to guard against
 DNS rebinding.
+
+With no token (the loopback default), a web page open in your browser can
+still address `127.0.0.1:49374`. The server refuses those requests on the
+machine and admin routes: a request the browser marks as cross-site
+(`Sec-Fetch-Site`), or one whose `Origin` is not the server's own host, gets a
+403. So does any browser request that is not a script `fetch()` call
+(`Sec-Fetch-Dest` other than `empty`): a link, image or navigation is refused
+even when it comes from the server's own pages or from another application.
+Hooks, the CLI and MCP clients never send those headers, and the web UI's own
+admin calls use `fetch()`.
+
+Browsers send that fetch metadata over plain HTTP only to `localhost`,
+`*.localhost`, `127.0.0.0/8` and `[::1]`. When an unauthenticated server is
+reached through any other name in the `Host` allowlist (a LAN address or name
+with `--allow-insecure-no-auth`, or `host.docker.internal` in the Docker
+image's default list), an image request carries neither fetch metadata nor
+`Origin`. There the session-start handoff fetch, the only state-changing `GET`,
+must also carry the `X-AI-Memory-Client` header that every ai-memory hook,
+CLI command and generated integration sends; a web page cannot add it without
+a CORS preflight, which these routes never answer. Hooks staged before this
+header existed get a 403 on such a server until you re-run
+`ai-memory install-hooks` (or `ai-memory upgrade`); on a loopback host they
+keep working unchanged. A request that carries a proxy's forwarding header
+(`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`,
+`X-Forwarded-Server`, `X-Forwarded-Port`, `X-Original-Forwarded-For`,
+`X-Real-IP`, `X-Client-IP`, `CF-Connecting-IP`, `True-Client-IP` or `Via`)
+counts as non-loopback here even when its `Host` is a loopback address,
+because a plain-HTTP reverse proxy may rewrite `Host` to the address it
+forwards to while the browser behind it saw a non-loopback origin. ai-memory's
+own clients connect directly and send none of these headers. The server cannot
+see a proxy that says nothing, though: nginx's default `proxy_pass` rewrites
+`Host` to the upstream address and adds no `Forwarded`, `X-Forwarded-*` or
+`Via` header, so its requests look like a local client's. A plain-HTTP proxy in
+front of an unauthenticated server must therefore add `X-Forwarded-For`
+(`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) or keep the
+browser's host (`proxy_set_header Host $host;`, which also needs that name in
+the `Host` allowlist). Better still, terminate TLS at the proxy or set a bearer
+token. A browser that sends no fetch metadata even to loopback
+(Safari before 16.4) only gets the `Origin` check there, which an image or link
+does not trigger; set a bearer token if you use one. The `Host`
+allowlist refuses DNS-rebinding hostnames, and the JSON-only routes refuse the
+content types a browser can send without a CORS preflight. The public sign-in
+routes (`POST /auth/login`, `POST /auth/recovery`) accept only
+`application/json` bodies too, so a page on another site cannot sign your
+browser in or try passwords. Images in wiki pages
+rendered by the web UI may only use relative paths that stay inside the UI, so
+viewing a stored page cannot make your browser call those routes either.
 
 Busy shared hook servers can also set `AI_MEMORY_HOOK_RATE_PER_SEC` (tokens per
 second per actor/session source) and optionally `AI_MEMORY_HOOK_RATE_BURST` to
@@ -79,24 +135,23 @@ sessions. Shared servers that rely on `[auto_scope]` session isolation still
 need explicit `workspace` + `project` / `scopes`, or a bridge that forwards the
 real lifecycle-hook session id on MCP requests.
 
-**Want HTTPS?** ai-memory deliberately does not terminate TLS itself —
-the right answer is a battle-tested reverse proxy in front of it.
-[`docs/https-via-proxy.md`](docs/https-via-proxy.md) is the deployment
+**HTTPS.** ai-memory deliberately does not terminate TLS itself; put a
+well-tested reverse proxy in front of it.
+[`docs/https-via-proxy.md`](https-via-proxy.md) is the deployment
 guide, with copy-paste docker compose templates in
-[`docker/compose.tls.caddy.yml`](docker/compose.tls.caddy.yml) (Caddy
+[`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml) (Caddy
 with Let's Encrypt or internal CA) and
-[`docker/compose.tls.cloudflared.yml`](docker/compose.tls.cloudflared.yml)
-(Cloudflare Tunnel — no open ports). Both are recommended once you
-turn on multi-user or bind beyond loopback. The Quick Start happy
-path of single-user on loopback doesn't need TLS — that case is
-called out explicitly in the guide so you don't add ceremony where
-it doesn't earn its keep.
+[`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml)
+(Cloudflare Tunnel, no open ports). Both are recommended once you
+turn on multi-user or bind beyond loopback. The Quick Start default
+of single-user on loopback doesn't need TLS; the guide says so
+explicitly so you don't add setup you don't need.
 
 **Multi-user attribution (v0.8, optional) plus human login.** When more
 than one human shares a server, ai-memory attributes each write to a
 named user. Humans sign in with username/password; agents and CLIs use
 `Authorization: Bearer` (`AI_MEMORY_AUTH_TOKEN` for root automation, or
-an `aim_` key from `ai-memory api-key add`). Data stays single-tenant —
+an `aim_` key from `ai-memory api-key add`). Data stays single-tenant:
 there is no per-page RBAC. A
 `[auth].token_pepper` is required for DB-user authentication, but creating the
 first user row is what immediately switches every `/admin/*` endpoint to
@@ -106,8 +161,8 @@ single-user behavior until a user is added. An SSO gateway can instead use a
 dedicated `[auth].actor_proxy_bearer_token` and trusted `X-Memory-Actor-*`
 headers; its credential is deliberately separate from the root bearer so a
 missing identity cannot become root. See
-[`docs/users.md`](docs/users.md) for the full walkthrough and the
+[`docs/users.md`](users.md) for the full walkthrough and the
 four-rung auth ladder.
 
-See [`docs/deploy.md`](docs/deploy.md) for the full homelab pattern
+See [`docs/deploy.md`](deploy.md) for the full homelab pattern
 with bearer auth, host allowlisting, and TLS/reverse-proxy options.

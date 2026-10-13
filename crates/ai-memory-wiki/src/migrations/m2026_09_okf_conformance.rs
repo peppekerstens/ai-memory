@@ -70,6 +70,8 @@ pub fn snapshot_before_db_migration(
     data_dir: &Path,
     dest_override: Option<&Path>,
 ) -> WikiResult<Option<crate::backup::BackupReceipt>> {
+    let wiki_root = data_dir.join("wiki");
+    crate::confinement::inspect_tree(&wiki_root)?;
     if crate::backup::BackupReceipt::load(data_dir).is_some_and(|r| r.archive_present()) {
         // A prior boot in this same upgrade already captured the pre-migration
         // state; do not overwrite it with a now-partially-migrated snapshot.
@@ -102,6 +104,7 @@ impl WikiMigration for OkfConformance {
     }
 
     async fn up(&self, writer: &WriterHandle, wiki_root: &Path) -> WikiResult<()> {
+        crate::confinement::inspect_tree(wiki_root)?;
         let data_dir = wiki_root.parent().ok_or_else(|| {
             WikiError::Io(std::io::Error::other("wiki root has no parent data dir"))
         })?;
@@ -152,6 +155,7 @@ impl WikiMigration for OkfConformance {
 
         // 2. Checkpoint whatever the tree holds before touching it.
         let git = crate::git::GitAdapter::open_or_init(wiki_root)?;
+        crate::confinement::inspect_git_directory(wiki_root)?;
         git.commit_all("pre-okf-migration checkpoint")?;
 
         // 3. DB pass — in place, through the single writer.
@@ -177,6 +181,7 @@ impl WikiMigration for OkfConformance {
         ensure_bundle_indexes(&git)?;
 
         // 5. One commit for the whole rewrite.
+        crate::confinement::inspect_git_directory(wiki_root)?;
         git.commit_all("okf-migration: conform wiki to OKF v0.2")?;
         tracing::info!(
             rows = migrated.len(),
@@ -606,6 +611,39 @@ mod tests {
             "the body must reach disk exactly as it was authored: {conformed:?}"
         );
         assert_eq!(parse(&conformed).unwrap().frontmatter["type"], "Note");
+    }
+
+    /// A CRLF page already has a frontmatter block; the parser must see it
+    /// so the pass fills that block instead of writing a fresh one above it.
+    /// The duplicate-frontmatter shape is exactly the basic-memory #528 bug
+    /// `markdown.rs` exists to avoid, and this pass is one-shot and in place.
+    #[test]
+    fn conforming_a_crlf_page_does_not_duplicate_its_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let rel = Path::new("w/p/notes/hand-written.md");
+        let abs = tmp.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(
+            &abs,
+            "---\r\ntitle: Hand written\r\npinned: true\r\n---\r\n# Hand written\r\n\r\nBody.\r\n",
+        )
+        .unwrap();
+
+        let git = crate::git::GitAdapter::open_or_init(tmp.path()).unwrap();
+        conform_file(&git, rel, &std::collections::HashMap::new()).unwrap();
+
+        let conformed = std::fs::read_to_string(&abs).unwrap();
+        let md = parse(&conformed).unwrap();
+        assert_eq!(
+            md.frontmatter["title"], "Hand written",
+            "the authored frontmatter must survive the pass: {conformed:?}"
+        );
+        assert_eq!(md.frontmatter["pinned"], true);
+        assert_eq!(md.frontmatter["type"], "Note");
+        assert_eq!(
+            md.body, "# Hand written\r\n\r\nBody.\r\n",
+            "the body must not gain a second frontmatter block: {conformed:?}"
+        );
     }
 
     // ---- #633: the safety archive must be taken BEFORE the DB migration ----

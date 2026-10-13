@@ -125,6 +125,9 @@ async fn a_declared_contradiction_is_a_lint_finding_without_an_llm() {
             dry_run: true,
             use_llm: false,
             decay_lambda: 0.02,
+            embedding: None,
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         },
     )
     .await
@@ -170,6 +173,9 @@ async fn a_contradiction_to_a_deleted_page_reports_the_stale_declaration() {
             dry_run: true,
             use_llm: false,
             decay_lambda: 0.02,
+            embedding: None,
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         },
     )
     .await
@@ -235,8 +241,11 @@ async fn lint_supersedes_one_report_and_prunes_the_legacy_daily_pile() {
         dry_run: false,
         use_llm: false,
         decay_lambda: 0.02,
+        embedding: None,
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
     };
-    let report = run_lint(&store.reader, &wiki, None, ws, proj, opts)
+    let report = run_lint(&store.reader, &wiki, None, ws, proj, opts.clone())
         .await
         .unwrap();
     assert!(!report.findings.is_empty(), "the stale page must be found");
@@ -257,7 +266,7 @@ async fn lint_supersedes_one_report_and_prunes_the_legacy_daily_pile() {
 
     // A second run with findings still present supersedes in place —
     // still exactly one latest lint page.
-    run_lint(&store.reader, &wiki, None, ws, proj, opts)
+    run_lint(&store.reader, &wiki, None, ws, proj, opts.clone())
         .await
         .unwrap();
     let latest_count: i64 = db
@@ -284,8 +293,11 @@ async fn a_clean_pass_removes_the_stale_report() {
         dry_run: false,
         use_llm: false,
         decay_lambda: 0.02,
+        embedding: None,
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
     };
-    run_lint(&store.reader, &wiki, None, ws, proj, opts)
+    run_lint(&store.reader, &wiki, None, ws, proj, opts.clone())
         .await
         .unwrap();
 
@@ -300,7 +312,7 @@ async fn a_clean_pass_removes_the_stale_report() {
     )
     .await
     .unwrap();
-    let report = run_lint(&store.reader, &wiki, None, ws, proj, opts)
+    let report = run_lint(&store.reader, &wiki, None, ws, proj, opts.clone())
         .await
         .unwrap();
     assert!(report.findings.is_empty(), "nothing left to find");

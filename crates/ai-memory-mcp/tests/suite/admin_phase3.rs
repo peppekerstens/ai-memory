@@ -47,6 +47,8 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),
@@ -316,6 +318,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: sid_a,
             workspace_id: ws,
             project_id: scratch,
@@ -329,6 +332,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
+                occurred_at: None,
                 session_id: sid_a,
                 workspace_id: ws,
                 project_id: scratch,
@@ -348,6 +352,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
     store
         .writer
         .begin_session(NewSession {
+            occurred_at: None,
             id: sid_b,
             workspace_id: ws,
             project_id: scratch,
@@ -361,6 +366,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
+                occurred_at: None,
                 session_id: sid_b,
                 workspace_id: ws,
                 project_id: scratch,
@@ -410,6 +416,60 @@ async fn reorg_dry_run_returns_plan_entries() {
     // dry-run → summary counters must be zero.
     assert_eq!(body["summary"]["sessions_moved"].as_u64().unwrap(), 0);
     assert!(body["dry_run"].as_bool().unwrap());
+}
+
+/// A cwd named like a reserved scope stays where it is: the reorg neither
+/// moves sessions into `_global` / a profile project nor creates one.
+#[tokio::test]
+async fn reorg_never_targets_a_reserved_scope() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let scratch = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for dir in [
+        "/home/user/_global",
+        "/home/user/_profile",
+        "/home/user/gamma-repo",
+    ] {
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: scratch,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some(std::path::PathBuf::from(dir)),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let resp = post(state, "/admin/reorg", json!({ "dry_run": false })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["summary"]["sessions_moved"].as_u64().unwrap(),
+        1,
+        "only the ordinary cwd moves: {body}"
+    );
+    let scopes = store.reader.list_all_scopes().await.unwrap();
+    assert!(
+        scopes
+            .iter()
+            .all(|s| s.project_name != "_profile" && s.project_name != "_global"),
+        "reorg must not create a reserved project: {scopes:?}"
+    );
+    assert!(scopes.iter().any(|s| s.project_name == "gamma-repo"));
 }
 
 #[tokio::test]
